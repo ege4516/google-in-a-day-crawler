@@ -60,7 +60,7 @@ func TestManager_StartCrawl(t *testing.T) {
 		SameDomain:     true,
 	}
 
-	done, err := m.StartCrawl(cfg)
+	_, done, err := m.StartCrawl(cfg)
 	if err != nil {
 		t.Fatalf("StartCrawl failed: %v", err)
 	}
@@ -107,13 +107,13 @@ func TestManager_RejectDuplicateCrawl(t *testing.T) {
 		SameDomain:     true,
 	}
 
-	_, err := m.StartCrawl(cfg)
+	_, _, err := m.StartCrawl(cfg)
 	if err != nil {
 		t.Fatalf("first StartCrawl failed: %v", err)
 	}
 
 	// Try to start a second crawl immediately — should be rejected
-	_, err = m.StartCrawl(cfg)
+	_, _, err = m.StartCrawl(cfg)
 	if err == nil {
 		t.Error("expected error when starting a second crawl, got nil")
 	}
@@ -145,7 +145,7 @@ func TestManager_StopCrawl(t *testing.T) {
 		SameDomain:     true,
 	}
 
-	done, err := m.StartCrawl(cfg)
+	_, done, err := m.StartCrawl(cfg)
 	if err != nil {
 		t.Fatalf("StartCrawl failed: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestManager_IsRunning(t *testing.T) {
 		SameDomain:     true,
 	}
 
-	done, _ := m.StartCrawl(cfg)
+	_, done, _ := m.StartCrawl(cfg)
 
 	// Should be running briefly
 	if !m.IsRunning() {
@@ -222,7 +222,7 @@ func TestManager_IndexAccumulates(t *testing.T) {
 	}
 
 	// First crawl: depth 0 = only seed page
-	done1, err := m.StartCrawl(cfg)
+	_, done1, err := m.StartCrawl(cfg)
 	if err != nil {
 		t.Fatalf("first crawl failed: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestManager_IndexAccumulates(t *testing.T) {
 
 	// Second crawl: depth 1 = seed + linked pages
 	cfg.MaxDepth = 1
-	done2, err := m.StartCrawl(cfg)
+	_, done2, err := m.StartCrawl(cfg)
 	if err != nil {
 		t.Fatalf("second crawl failed: %v", err)
 	}

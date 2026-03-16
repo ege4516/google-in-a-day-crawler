@@ -26,6 +26,7 @@ type Crawler struct {
 type Config struct {
 	SeedURL        string
 	MaxDepth       int
+	MaxURLs        int // 0 = unlimited; cap on total pages visited
 	NumWorkers     int
 	QueueSize      int
 	RequestTimeout time.Duration
@@ -42,8 +43,10 @@ type Metrics struct {
 	ActiveWorkers  atomic.Int64
 	IndexedDocs    atomic.Int64
 	OverflowSize   atomic.Int64
+	MaxURLs        atomic.Int64 // configured limit (0 = unlimited)
 	StartTime      time.Time
 	CrawlDone      atomic.Bool
+	StopReason     atomic.Value // string: "completed", "url_limit", "stopped", "failed"
 }
 
 // NewCrawler creates a new crawler instance. Pass nil for db to disable persistence.
@@ -127,8 +130,9 @@ func (c *Crawler) Start(ctx context.Context, resume *ResumeState) {
 		}
 	}
 	c.metrics.PagesQueued.Add(int64(len(initialQueue)))
-	c.metrics.QueueDepth.Add(int64(enqueued))
-	c.metrics.ActiveWorkers.Add(int64(enqueued))
+	c.metrics.QueueDepth.Store(int64(enqueued + len(overflow)))
+	c.metrics.ActiveWorkers.Store(int64(c.cfg.NumWorkers))
+	c.metrics.MaxURLs.Store(int64(c.cfg.MaxURLs))
 
 	// Launch workers
 	var wg sync.WaitGroup
@@ -212,7 +216,18 @@ func (c *Crawler) Start(ctx context.Context, resume *ResumeState) {
 		}
 	}
 
+	// Set stop reason
+	if ctx.Err() != nil {
+		c.metrics.StopReason.Store("stopped")
+	} else if c.cfg.MaxURLs > 0 && c.metrics.PagesProcessed.Load() >= int64(c.cfg.MaxURLs) {
+		c.metrics.StopReason.Store("url_limit")
+	} else {
+		c.metrics.StopReason.Store("completed")
+	}
+
 	c.metrics.CrawlDone.Store(true)
+	c.metrics.ActiveWorkers.Store(0)
+	c.metrics.QueueDepth.Store(0)
 	log.Printf("Crawl complete. Processed: %d, Indexed: %d, Errors: %d",
 		c.metrics.PagesProcessed.Load(),
 		c.metrics.IndexedDocs.Load(),
@@ -264,7 +279,33 @@ func (c *Crawler) coordinatorLoop(ctx context.Context, taskCh chan CrawlTask, di
 		log.Printf("Saved %d queued tasks and %d visited URLs for resume", len(remaining), len(visited))
 	}
 
+	updateQueueMetrics := func() {
+		c.metrics.QueueDepth.Store(int64(inFlight + len(overflow)))
+		c.metrics.OverflowSize.Store(int64(len(overflow)))
+	}
+
+	urlLimitReached := func() bool {
+		return c.cfg.MaxURLs > 0 && c.metrics.PagesProcessed.Load() >= int64(c.cfg.MaxURLs)
+	}
+
 	for inFlight > 0 || len(overflow) > 0 {
+		// If URL limit reached, stop enqueueing new tasks — just drain in-flight
+		if urlLimitReached() {
+			overflow = nil
+			if inFlight == 0 {
+				break
+			}
+			select {
+			case <-discoveredCh:
+				inFlight--
+				updateQueueMetrics()
+			case <-ctx.Done():
+				saveQueue()
+				return
+			}
+			continue
+		}
+
 		if len(overflow) > 0 {
 			select {
 			case taskCh <- overflow[0]:
@@ -275,19 +316,15 @@ func (c *Crawler) coordinatorLoop(ctx context.Context, taskCh chan CrawlTask, di
 					overflow = trimmed
 				}
 				inFlight++
-				c.metrics.QueueDepth.Add(1)
-				c.metrics.ActiveWorkers.Add(1)
-				c.metrics.OverflowSize.Store(int64(len(overflow)))
+				updateQueueMetrics()
 			case batch := <-discoveredCh:
 				inFlight--
-				c.metrics.QueueDepth.Add(-1)
-				c.metrics.ActiveWorkers.Add(-1)
 				newTasks := c.deduplicateAndMark(batch, visited)
 				for _, t := range newTasks {
 					newVisited = append(newVisited, t.URL)
 				}
 				overflow = append(overflow, newTasks...)
-				c.metrics.OverflowSize.Store(int64(len(overflow)))
+				updateQueueMetrics()
 			case <-persistTicker.C:
 				flushVisited()
 			case <-ctx.Done():
@@ -298,8 +335,6 @@ func (c *Crawler) coordinatorLoop(ctx context.Context, taskCh chan CrawlTask, di
 			select {
 			case batch := <-discoveredCh:
 				inFlight--
-				c.metrics.QueueDepth.Add(-1)
-				c.metrics.ActiveWorkers.Add(-1)
 				newTasks := c.deduplicateAndMark(batch, visited)
 				for _, t := range newTasks {
 					newVisited = append(newVisited, t.URL)
@@ -308,13 +343,11 @@ func (c *Crawler) coordinatorLoop(ctx context.Context, taskCh chan CrawlTask, di
 					select {
 					case taskCh <- t:
 						inFlight++
-						c.metrics.QueueDepth.Add(1)
-						c.metrics.ActiveWorkers.Add(1)
 					default:
 						overflow = append(overflow, t)
 					}
 				}
-				c.metrics.OverflowSize.Store(int64(len(overflow)))
+				updateQueueMetrics()
 			case <-persistTicker.C:
 				flushVisited()
 			case <-ctx.Done():
@@ -332,7 +365,7 @@ func (c *Crawler) coordinatorLoop(ctx context.Context, taskCh chan CrawlTask, di
 }
 
 // deduplicateAndMark filters out already-visited and over-depth URLs,
-// marking new ones as visited.
+// marking new ones as visited. Also respects MaxURLs limit.
 func (c *Crawler) deduplicateAndMark(tasks []CrawlTask, visited map[string]bool) []CrawlTask {
 	var result []CrawlTask
 	for _, t := range tasks {
@@ -341,6 +374,10 @@ func (c *Crawler) deduplicateAndMark(tasks []CrawlTask, visited map[string]bool)
 		}
 		if visited[t.URL] {
 			continue
+		}
+		// Respect MaxURLs: visited count is a proxy for total pages that will be processed
+		if c.cfg.MaxURLs > 0 && len(visited) >= c.cfg.MaxURLs {
+			break
 		}
 		visited[t.URL] = true
 		result = append(result, t)
@@ -352,6 +389,7 @@ func (c *Crawler) deduplicateAndMark(tasks []CrawlTask, visited map[string]bool)
 // MetricsSnapshot returns a point-in-time snapshot of all metrics.
 func (m *Metrics) Snapshot() MetricsSnapshot {
 	overflow := m.OverflowSize.Load()
+	reason, _ := m.StopReason.Load().(string)
 	return MetricsSnapshot{
 		PagesProcessed:     m.PagesProcessed.Load(),
 		PagesQueued:        m.PagesQueued.Load(),
@@ -360,9 +398,11 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		ActiveWorkers:      m.ActiveWorkers.Load(),
 		IndexedDocs:        m.IndexedDocs.Load(),
 		OverflowSize:       overflow,
+		MaxURLs:            m.MaxURLs.Load(),
 		BackPressureActive: overflow > 0,
 		Uptime:             time.Since(m.StartTime),
 		CrawlDone:          m.CrawlDone.Load(),
+		StopReason:         reason,
 	}
 }
 
@@ -375,10 +415,12 @@ type MetricsSnapshot struct {
 	ActiveWorkers      int64         `json:"active_workers"`
 	IndexedDocs        int64         `json:"indexed_docs"`
 	OverflowSize       int64         `json:"overflow_size"`
+	MaxURLs            int64         `json:"max_urls"`
 	BackPressureActive bool          `json:"back_pressure_active"`
 	Uptime             time.Duration `json:"uptime_ns"`
 	UptimeStr          string        `json:"uptime"`
 	CrawlDone          bool          `json:"crawl_done"`
+	StopReason         string        `json:"stop_reason,omitempty"`
 }
 
 func (c *Crawler) GetMetrics() *Metrics {

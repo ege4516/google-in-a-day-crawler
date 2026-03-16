@@ -21,6 +21,7 @@ import (
 type CrawlConfig struct {
 	SeedURL        string
 	MaxDepth       int
+	MaxURLs        int
 	NumWorkers     int
 	QueueSize      int
 	RequestTimeout time.Duration
@@ -34,6 +35,7 @@ func parseFlags() CrawlConfig {
 	cfg := CrawlConfig{}
 	flag.StringVar(&cfg.SeedURL, "seed", "", "Seed URL (optional; omit for dashboard-only mode)")
 	flag.IntVar(&cfg.MaxDepth, "depth", 3, "Maximum crawl depth from seed")
+	flag.IntVar(&cfg.MaxURLs, "max-urls", 0, "Maximum total URLs to visit (0 = unlimited)")
 	flag.IntVar(&cfg.NumWorkers, "workers", 5, "Number of concurrent crawler workers")
 	flag.IntVar(&cfg.QueueSize, "queue-size", 10000, "Bounded task queue capacity")
 	flag.DurationVar(&cfg.RequestTimeout, "timeout", 10*time.Second, "HTTP request timeout")
@@ -150,6 +152,7 @@ func main() {
 		crawlerCfg := crawler.Config{
 			SeedURL:        cfg.SeedURL,
 			MaxDepth:       cfg.MaxDepth,
+			MaxURLs:        cfg.MaxURLs,
 			NumWorkers:     cfg.NumWorkers,
 			QueueSize:      cfg.QueueSize,
 			RequestTimeout: cfg.RequestTimeout,
@@ -157,7 +160,7 @@ func main() {
 			SameDomain:     cfg.SameDomain,
 		}
 
-		done, err := manager.StartCrawl(crawlerCfg)
+		_, done, err := manager.StartCrawl(crawlerCfg)
 		if err != nil {
 			log.Fatalf("Failed to start crawl: %v", err)
 		}

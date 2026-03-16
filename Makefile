@@ -1,6 +1,5 @@
-BINARY_NAME=crawler
+BINARY_NAME=crawler.exe
 GO=go
-GOFLAGS=-race
 
 .PHONY: build run test clean fmt vet
 
@@ -11,7 +10,7 @@ run: build
 	./$(BINARY_NAME) -seed https://go.dev -depth 2 -workers 5
 
 test:
-	$(GO) test $(GOFLAGS) ./...
+	$(GO) test ./...
 
 fmt:
 	$(GO) fmt ./...
@@ -20,5 +19,5 @@ vet:
 	$(GO) vet ./...
 
 clean:
-	rm -f $(BINARY_NAME) $(BINARY_NAME).exe
+	rm -f $(BINARY_NAME) crawler
 	rm -f data/*.db data/*.db-wal data/*.db-shm

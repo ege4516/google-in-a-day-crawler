@@ -30,6 +30,26 @@ type QueuedTask struct {
 	Depth     int
 }
 
+// CrawlSession represents a historical crawl record.
+type CrawlSession struct {
+	ID           int64  `json:"id"`
+	OriginURL    string `json:"origin_url"`
+	MaxDepth     int    `json:"max_depth"`
+	MaxURLs      int    `json:"max_urls"`
+	NumWorkers   int    `json:"num_workers"`
+	QueueSize    int    `json:"queue_size"`
+	SameDomain   bool   `json:"same_domain"`
+	Status       string `json:"status"` // queued, running, completed, stopped, failed
+	VisitedCount int64  `json:"visited_count"`
+	QueuedCount  int64  `json:"queued_count"`
+	IndexedCount int64  `json:"indexed_count"`
+	ErrorCount   int64  `json:"error_count"`
+	StopReason   string `json:"stop_reason,omitempty"`
+	ErrorMessage string `json:"error_message,omitempty"`
+	StartedAt    string `json:"started_at"`
+	FinishedAt   string `json:"finished_at,omitempty"`
+}
+
 // Open creates or opens a SQLite database at the given path.
 func Open(path string) (*DB, error) {
 	dir := filepath.Dir(path)
@@ -98,6 +118,25 @@ func (db *DB) migrate() error {
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_postings_token ON postings(token);
+
+	CREATE TABLE IF NOT EXISTS crawl_sessions (
+		id            INTEGER PRIMARY KEY AUTOINCREMENT,
+		origin_url    TEXT NOT NULL,
+		max_depth     INTEGER NOT NULL,
+		max_urls      INTEGER NOT NULL DEFAULT 0,
+		num_workers   INTEGER NOT NULL,
+		queue_size    INTEGER NOT NULL DEFAULT 10000,
+		same_domain   INTEGER NOT NULL DEFAULT 0,
+		status        TEXT NOT NULL DEFAULT 'queued',
+		visited_count INTEGER NOT NULL DEFAULT 0,
+		queued_count  INTEGER NOT NULL DEFAULT 0,
+		indexed_count INTEGER NOT NULL DEFAULT 0,
+		error_count   INTEGER NOT NULL DEFAULT 0,
+		stop_reason   TEXT NOT NULL DEFAULT '',
+		error_message TEXT NOT NULL DEFAULT '',
+		started_at    TEXT NOT NULL DEFAULT '',
+		finished_at   TEXT NOT NULL DEFAULT ''
+	);
 	`
 	_, err := db.conn.Exec(schema)
 	return err
@@ -314,6 +353,98 @@ func (db *DB) ClearAll() error {
 		DELETE FROM postings;
 	`)
 	return err
+}
+
+// --- CrawlSession CRUD ---
+
+// CreateCrawlSession inserts a new crawl session record and returns its ID.
+func (db *DB) CreateCrawlSession(s CrawlSession) (int64, error) {
+	res, err := db.conn.Exec(`
+		INSERT INTO crawl_sessions (origin_url, max_depth, max_urls, num_workers, queue_size, same_domain, status, started_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		s.OriginURL, s.MaxDepth, s.MaxURLs, s.NumWorkers, s.QueueSize, boolToInt(s.SameDomain), s.Status, s.StartedAt)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// UpdateCrawlSessionMetrics updates the live counters for a running crawl.
+func (db *DB) UpdateCrawlSessionMetrics(id int64, visited, queued, indexed, errors int64) error {
+	_, err := db.conn.Exec(`
+		UPDATE crawl_sessions SET visited_count = ?, queued_count = ?, indexed_count = ?, error_count = ?
+		WHERE id = ?`, visited, queued, indexed, errors, id)
+	return err
+}
+
+// FinishCrawlSession marks a session as finished with the given status and reason.
+func (db *DB) FinishCrawlSession(id int64, status, stopReason, finishedAt string, visited, queued, indexed, errors int64) error {
+	_, err := db.conn.Exec(`
+		UPDATE crawl_sessions SET status = ?, stop_reason = ?, finished_at = ?,
+		visited_count = ?, queued_count = ?, indexed_count = ?, error_count = ?
+		WHERE id = ?`, status, stopReason, finishedAt, visited, queued, indexed, errors, id)
+	return err
+}
+
+// LoadAllCrawlSessions returns all crawl sessions ordered by most recent first.
+func (db *DB) LoadAllCrawlSessions() ([]CrawlSession, error) {
+	rows, err := db.conn.Query(`
+		SELECT id, origin_url, max_depth, max_urls, num_workers, queue_size, same_domain,
+		       status, visited_count, queued_count, indexed_count, error_count,
+		       stop_reason, error_message, started_at, finished_at
+		FROM crawl_sessions ORDER BY id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sessions []CrawlSession
+	for rows.Next() {
+		var s CrawlSession
+		var sameDomain int
+		if err := rows.Scan(&s.ID, &s.OriginURL, &s.MaxDepth, &s.MaxURLs, &s.NumWorkers,
+			&s.QueueSize, &sameDomain, &s.Status, &s.VisitedCount, &s.QueuedCount,
+			&s.IndexedCount, &s.ErrorCount, &s.StopReason, &s.ErrorMessage,
+			&s.StartedAt, &s.FinishedAt); err != nil {
+			return nil, err
+		}
+		s.SameDomain = sameDomain != 0
+		sessions = append(sessions, s)
+	}
+	return sessions, rows.Err()
+}
+
+// LoadCrawlSession loads a single crawl session by ID.
+func (db *DB) LoadCrawlSession(id int64) (*CrawlSession, error) {
+	var s CrawlSession
+	var sameDomain int
+	err := db.conn.QueryRow(`
+		SELECT id, origin_url, max_depth, max_urls, num_workers, queue_size, same_domain,
+		       status, visited_count, queued_count, indexed_count, error_count,
+		       stop_reason, error_message, started_at, finished_at
+		FROM crawl_sessions WHERE id = ?`, id).
+		Scan(&s.ID, &s.OriginURL, &s.MaxDepth, &s.MaxURLs, &s.NumWorkers,
+			&s.QueueSize, &sameDomain, &s.Status, &s.VisitedCount, &s.QueuedCount,
+			&s.IndexedCount, &s.ErrorCount, &s.StopReason, &s.ErrorMessage,
+			&s.StartedAt, &s.FinishedAt)
+	if err != nil {
+		return nil, err
+	}
+	s.SameDomain = sameDomain != 0
+	return &s, nil
+}
+
+// DeleteCompletedCrawlSessions removes all non-running sessions.
+func (db *DB) DeleteCompletedCrawlSessions() error {
+	_, err := db.conn.Exec(`DELETE FROM crawl_sessions WHERE status NOT IN ('running', 'queued')`)
+	return err
+}
+
+// CountWordTokens returns the number of unique tokens in the postings table.
+func (db *DB) CountWordTokens() (int64, error) {
+	var count int64
+	err := db.conn.QueryRow(`SELECT COUNT(DISTINCT token) FROM postings`).Scan(&count)
+	return count, err
 }
 
 func boolToInt(b bool) int {

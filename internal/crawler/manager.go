@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/ege/google-in-a-day/internal/index"
 	"github.com/ege/google-in-a-day/internal/storage"
@@ -14,14 +15,15 @@ import (
 // crawls without leaking Crawler internals. It owns the Index (stable across crawls)
 // and the current Metrics pointer.
 type Manager struct {
-	mu        sync.Mutex
-	idx       *index.Index
-	metrics   *Metrics // current or most recent crawl; never nil
-	running   bool
-	cancelFn  context.CancelFunc
-	done      chan struct{}
-	parentCtx context.Context
-	db        *storage.DB // optional persistence; nil disables it
+	mu              sync.Mutex
+	idx             *index.Index
+	metrics         *Metrics // current or most recent crawl; never nil
+	running         bool
+	cancelFn        context.CancelFunc
+	done            chan struct{}
+	parentCtx       context.Context
+	db              *storage.DB // optional persistence; nil disables it
+	activeSessionID int64       // DB id of the currently running crawl session
 }
 
 // NewManager creates a Manager with a fresh Index and zeroed Metrics.
@@ -118,35 +120,41 @@ func (m *Manager) ResumeCrawl(cfg Config) (<-chan struct{}, error) {
 	crawlCtx, cancelFn := context.WithCancel(m.parentCtx)
 	m.cancelFn = cancelFn
 
+	// Create session record
+	sessionID := m.createSession(cfg, "running")
+	m.activeSessionID = sessionID
+
 	c := NewCrawler(cfg, m.idx, m.metrics, m.db)
 
 	done := make(chan struct{})
 	m.done = done
 	go func() {
 		defer func() {
+			m.finishSession(sessionID)
 			m.mu.Lock()
 			m.running = false
+			m.activeSessionID = 0
 			m.mu.Unlock()
 			close(done)
 		}()
+		m.startSessionUpdater(crawlCtx, sessionID)
 		c.Start(crawlCtx, &ResumeState{Visited: visited, Queue: queue})
 	}()
 
 	return done, nil
 }
 
-// StartCrawl launches a crawl in a background goroutine. Returns an error if
-// a crawl is already in progress. The returned channel closes when the crawl
-// finishes.
-func (m *Manager) StartCrawl(cfg Config) (<-chan struct{}, error) {
+// StartCrawl launches a crawl in a background goroutine. Returns the session ID
+// and a done channel. Returns an error if a crawl is already in progress.
+func (m *Manager) StartCrawl(cfg Config) (int64, <-chan struct{}, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.running {
-		return nil, errors.New("a crawl is already in progress")
+		return 0, nil, errors.New("a crawl is already in progress")
 	}
 
-	// Clear previous state for a fresh crawl
+	// Clear previous resume state for a fresh crawl
 	if m.db != nil {
 		m.db.ClearAll()
 	}
@@ -157,21 +165,94 @@ func (m *Manager) StartCrawl(cfg Config) (<-chan struct{}, error) {
 	crawlCtx, cancelFn := context.WithCancel(m.parentCtx)
 	m.cancelFn = cancelFn
 
+	// Create session record
+	sessionID := m.createSession(cfg, "running")
+	m.activeSessionID = sessionID
+
 	c := NewCrawler(cfg, m.idx, m.metrics, m.db)
 
 	done := make(chan struct{})
 	m.done = done
 	go func() {
 		defer func() {
+			m.finishSession(sessionID)
 			m.mu.Lock()
 			m.running = false
+			m.activeSessionID = 0
 			m.mu.Unlock()
 			close(done)
 		}()
+		m.startSessionUpdater(crawlCtx, sessionID)
 		c.Start(crawlCtx, nil)
 	}()
 
-	return done, nil
+	return sessionID, done, nil
+}
+
+// createSession inserts a crawl session record into the DB. Returns 0 if no DB.
+func (m *Manager) createSession(cfg Config, status string) int64 {
+	if m.db == nil {
+		return 0
+	}
+	id, err := m.db.CreateCrawlSession(storage.CrawlSession{
+		OriginURL:  cfg.SeedURL,
+		MaxDepth:   cfg.MaxDepth,
+		MaxURLs:    cfg.MaxURLs,
+		NumWorkers: cfg.NumWorkers,
+		QueueSize:  cfg.QueueSize,
+		SameDomain: cfg.SameDomain,
+		Status:     status,
+		StartedAt:  time.Now().UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		log.Printf("Warning: failed to create crawl session: %v", err)
+		return 0
+	}
+	return id
+}
+
+// startSessionUpdater launches a goroutine that periodically writes live metrics to the DB.
+func (m *Manager) startSessionUpdater(ctx context.Context, sessionID int64) {
+	if m.db == nil || sessionID == 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				snap := m.metrics.Snapshot()
+				m.db.UpdateCrawlSessionMetrics(sessionID,
+					snap.PagesProcessed, snap.PagesQueued, snap.IndexedDocs, snap.PagesErrored)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+// finishSession writes final metrics and status to the DB session record.
+func (m *Manager) finishSession(sessionID int64) {
+	if m.db == nil || sessionID == 0 {
+		return
+	}
+	snap := m.metrics.Snapshot()
+	status := "completed"
+	reason := snap.StopReason
+	switch reason {
+	case "stopped":
+		status = "stopped"
+	case "url_limit":
+		status = "completed"
+	case "failed":
+		status = "failed"
+	default:
+		status = "completed"
+	}
+	m.db.FinishCrawlSession(sessionID, status, reason,
+		time.Now().UTC().Format(time.RFC3339),
+		snap.PagesProcessed, snap.PagesQueued, snap.IndexedDocs, snap.PagesErrored)
 }
 
 // StopCrawl cancels the running crawl, if any.
@@ -213,4 +294,11 @@ func (m *Manager) Done() <-chan struct{} {
 // GetDB returns the storage database (may be nil).
 func (m *Manager) GetDB() *storage.DB {
 	return m.db
+}
+
+// ActiveSessionID returns the DB id of the currently running crawl (0 if none).
+func (m *Manager) ActiveSessionID() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.activeSessionID
 }
