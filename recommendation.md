@@ -1,0 +1,5 @@
+# Recommendation: Next Steps for Production Deployment
+
+To move this crawler into production, the first priorities are **persistence and scaling**. Replace the in-memory inverted index with SQLite (using the FTS5 full-text search extension) or Elasticsearch for larger corpora. Swap the in-process Go channel for a persistent task queue (Redis Streams or similar) so crawls survive process restarts and multiple crawler instances can share work. Add robots.txt parsing and per-host rate limiting — these are legal and ethical requirements for any production web crawler.
+
+On the **operational side**, add structured logging with correlation IDs, export Prometheus metrics for alerting and capacity planning, and implement SSRF protection on the HTTP client (block internal network ranges like 10.0.0.0/8 and 169.254.169.254). A CI/CD pipeline with race-detector tests, static analysis, and automated deployment would round out production readiness. The current architecture — coordinator pattern, bounded channels, RWMutex index — provides a solid single-machine foundation that extends naturally to these production requirements.

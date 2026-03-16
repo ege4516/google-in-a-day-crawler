@@ -1,0 +1,28 @@
+# Binary
+/crawler
+/crawler.exe
+*.exe
+
+# Runtime data
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Go
+/vendor/
+
+# Plan files (internal)
+PLAN.md
