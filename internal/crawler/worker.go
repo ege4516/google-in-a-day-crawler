@@ -37,7 +37,8 @@ type WorkerConfig struct {
 	RequestTimeout time.Duration
 	MaxBodySize    int64
 	SameDomain     bool
-	SeedHost       string
+	SeedHost       string          // legacy single host
+	SeedHosts      map[string]bool // multiple seed hosts for multi-URL crawls
 }
 
 // workerLoop reads tasks from taskCh, processes each page, and sends results.
@@ -55,8 +56,8 @@ func workerLoop(ctx context.Context, id int, cfg WorkerConfig, taskCh <-chan Cra
 
 	for task := range taskCh {
 		if ctx.Err() != nil {
-			// Send empty batch so coordinator can decrement inFlight
-			discoveredCh <- nil
+			// Return the unconsumed task back so coordinator can save it for resume
+			discoveredCh <- []CrawlTask{task}
 			continue
 		}
 
@@ -103,7 +104,7 @@ func processPage(ctx context.Context, client *http.Client, cfg WorkerConfig, tas
 		if err != nil {
 			continue
 		}
-		if !isValidCrawlTarget(normalized, cfg.SameDomain, cfg.SeedHost) {
+		if !isValidCrawlTarget(normalized, cfg.SameDomain, cfg.SeedHost, cfg.SeedHosts) {
 			continue
 		}
 		validLinks = append(validLinks, normalized)
@@ -225,7 +226,8 @@ func normalizeURL(rawHref, baseURL string) (string, error) {
 }
 
 // isValidCrawlTarget checks if a URL should be crawled.
-func isValidCrawlTarget(rawURL string, sameDomain bool, seedHost string) bool {
+// It accepts both a single seedHost (legacy) and a map of seedHosts for multi-URL crawls.
+func isValidCrawlTarget(rawURL string, sameDomain bool, seedHost string, seedHosts ...map[string]bool) bool {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return false
@@ -253,10 +255,18 @@ func isValidCrawlTarget(rawURL string, sameDomain bool, seedHost string) bool {
 		}
 	}
 
-	// Same-domain check
-	if sameDomain && seedHost != "" {
-		if strings.ToLower(u.Host) != strings.ToLower(seedHost) {
-			return false
+	// Same-domain check: allow if host matches any seed host
+	if sameDomain {
+		host := strings.ToLower(u.Host)
+		// Check multi-host map first
+		if len(seedHosts) > 0 && len(seedHosts[0]) > 0 {
+			if !seedHosts[0][host] {
+				return false
+			}
+		} else if seedHost != "" {
+			if host != strings.ToLower(seedHost) {
+				return false
+			}
 		}
 	}
 

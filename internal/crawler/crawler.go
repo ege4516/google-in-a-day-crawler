@@ -16,15 +16,17 @@ import (
 
 // Crawler orchestrates the crawl: coordinator goroutine, worker pool, and indexer.
 type Crawler struct {
-	cfg     Config
-	index   *index.Index
-	metrics *Metrics
-	db      *storage.DB // optional persistence; nil disables it
+	cfg       Config
+	sessionID int64
+	index     *index.Index
+	metrics   *Metrics
+	db        *storage.DB // optional persistence; nil disables it
 }
 
 // Config holds crawler configuration.
 type Config struct {
-	SeedURL        string
+	SeedURL        string   // primary seed (kept for backward compat / display)
+	SeedURLs       []string // one or more seed URLs; if empty, SeedURL is used
 	MaxDepth       int
 	MaxURLs        int // 0 = unlimited; cap on total pages visited
 	NumWorkers     int
@@ -32,6 +34,17 @@ type Config struct {
 	RequestTimeout time.Duration
 	MaxBodySize    int64
 	SameDomain     bool
+}
+
+// Seeds returns the effective list of seed URLs, falling back to SeedURL.
+func (c Config) Seeds() []string {
+	if len(c.SeedURLs) > 0 {
+		return c.SeedURLs
+	}
+	if c.SeedURL != "" {
+		return []string{c.SeedURL}
+	}
+	return nil
 }
 
 // Metrics holds atomic counters for observability.
@@ -50,12 +63,13 @@ type Metrics struct {
 }
 
 // NewCrawler creates a new crawler instance. Pass nil for db to disable persistence.
-func NewCrawler(cfg Config, idx *index.Index, metrics *Metrics, db *storage.DB) *Crawler {
+func NewCrawler(cfg Config, sessionID int64, idx *index.Index, metrics *Metrics, db *storage.DB) *Crawler {
 	return &Crawler{
-		cfg:     cfg,
-		index:   idx,
-		metrics: metrics,
-		db:      db,
+		cfg:       cfg,
+		sessionID: sessionID,
+		index:     idx,
+		metrics:   metrics,
+		db:        db,
 	}
 }
 
@@ -71,16 +85,22 @@ type ResumeState struct {
 func (c *Crawler) Start(ctx context.Context, resume *ResumeState) {
 	c.metrics.StartTime = time.Now()
 
-	seedHost := ""
-	if u, err := url.Parse(c.cfg.SeedURL); err == nil {
-		seedHost = u.Host
+	seeds := c.cfg.Seeds()
+
+	// Collect seed hosts for same-domain enforcement
+	seedHosts := make(map[string]bool)
+	for _, s := range seeds {
+		if u, err := url.Parse(s); err == nil && u.Host != "" {
+			seedHosts[u.Host] = true
+		}
 	}
 
 	workerCfg := WorkerConfig{
 		RequestTimeout: c.cfg.RequestTimeout,
 		MaxBodySize:    c.cfg.MaxBodySize,
 		SameDomain:     c.cfg.SameDomain,
-		SeedHost:       seedHost,
+		SeedHost:       "", // legacy single-host (unused when SeedHosts is set)
+		SeedHosts:      seedHosts,
 	}
 
 	// Channels
@@ -92,30 +112,22 @@ func (c *Crawler) Start(ctx context.Context, resume *ResumeState) {
 	visited := make(map[string]bool)
 	var initialQueue []CrawlTask
 
-	if resume != nil && len(resume.Queue) > 0 {
+	if resume != nil && len(resume.Visited) > 0 {
 		// Resuming: use pre-loaded visited set and queue
 		visited = resume.Visited
 		initialQueue = resume.Queue
 		log.Printf("Resuming crawl with %d visited URLs and %d queued tasks", len(visited), len(initialQueue))
 	} else {
-		// Fresh crawl: seed the first task
-		seedTask := CrawlTask{
-			URL:       c.cfg.SeedURL,
-			OriginURL: "",
-			Depth:     0,
+		// Fresh crawl: seed all URLs
+		for _, seedURL := range seeds {
+			task := CrawlTask{
+				URL:       seedURL,
+				OriginURL: "",
+				Depth:     0,
+			}
+			initialQueue = append(initialQueue, task)
+			visited[seedURL] = true
 		}
-		initialQueue = []CrawlTask{seedTask}
-		visited[c.cfg.SeedURL] = true
-	}
-
-	// Save crawl state to DB
-	if c.db != nil {
-		c.db.SaveCrawlState(storage.CrawlState{
-			SeedURL:    c.cfg.SeedURL,
-			MaxDepth:   c.cfg.MaxDepth,
-			NumWorkers: c.cfg.NumWorkers,
-			SameDomain: c.cfg.SameDomain,
-		})
 	}
 
 	// Enqueue initial tasks
@@ -207,13 +219,8 @@ func (c *Crawler) Start(ctx context.Context, resume *ResumeState) {
 	<-indexDone
 
 	// Mark completion in DB
-	if c.db != nil {
-		if ctx.Err() != nil {
-			// Interrupted — save remaining queue for resume
-			log.Printf("Crawl interrupted, saving state for resume...")
-		} else {
-			c.db.MarkCrawlComplete()
-		}
+	if c.db != nil && ctx.Err() != nil {
+		log.Printf("Crawl interrupted, state saved for resume...")
 	}
 
 	// Set stop reason
@@ -238,7 +245,14 @@ func (c *Crawler) Start(ctx context.Context, resume *ResumeState) {
 // workers, deduplicates them, and enqueues new tasks. It tracks an inFlight
 // counter to detect crawl completion.
 func (c *Crawler) coordinatorLoop(ctx context.Context, taskCh chan CrawlTask, discoveredCh <-chan []CrawlTask, visited map[string]bool, overflow []CrawlTask, inFlight int) {
-	defer close(taskCh)
+	taskChClosed := false
+	closeTaskCh := func() {
+		if !taskChClosed {
+			close(taskCh)
+			taskChClosed = true
+		}
+	}
+	defer closeTaskCh()
 
 	// Batch persist visited URLs periodically
 	var newVisited []string
@@ -247,8 +261,26 @@ func (c *Crawler) coordinatorLoop(ctx context.Context, taskCh chan CrawlTask, di
 
 	flushVisited := func() {
 		if c.db != nil && len(newVisited) > 0 {
-			c.db.AddVisitedURLs(newVisited)
+			if c.sessionID > 0 {
+				c.db.AddSessionVisitedURLs(c.sessionID, newVisited)
+			} else {
+				c.db.AddVisitedURLs(newVisited)
+			}
 			newVisited = newVisited[:0]
+		}
+	}
+
+	// drainInFlight waits for all in-flight workers to respond before saving queue.
+	// First closes taskCh so workers can't take more tasks, then collects responses.
+	drainInFlight := func() {
+		closeTaskCh() // prevent workers from consuming more tasks
+		for inFlight > 0 {
+			batch := <-discoveredCh
+			inFlight--
+			// Workers return unconsumed tasks when ctx is cancelled — add them to overflow
+			for _, t := range batch {
+				overflow = append(overflow, t)
+			}
 		}
 	}
 
@@ -256,25 +288,16 @@ func (c *Crawler) coordinatorLoop(ctx context.Context, taskCh chan CrawlTask, di
 		if c.db == nil {
 			return
 		}
-		// Save remaining overflow + anything in taskCh buffer
+		// At this point inFlight==0, taskCh is closed, all tasks are in overflow
 		var remaining []storage.QueuedTask
 		for _, t := range overflow {
 			remaining = append(remaining, storage.QueuedTask{URL: t.URL, OriginURL: t.OriginURL, Depth: t.Depth})
 		}
-		// Drain the channel buffer
-	drain:
-		for {
-			select {
-			case t, ok := <-taskCh:
-				if !ok {
-					break drain
-				}
-				remaining = append(remaining, storage.QueuedTask{URL: t.URL, OriginURL: t.OriginURL, Depth: t.Depth})
-			default:
-				break drain
-			}
+		if c.sessionID > 0 {
+			c.db.SaveSessionQueuedTasks(c.sessionID, remaining)
+		} else {
+			c.db.SaveQueuedTasks(remaining)
 		}
-		c.db.SaveQueuedTasks(remaining)
 		flushVisited()
 		log.Printf("Saved %d queued tasks and %d visited URLs for resume", len(remaining), len(visited))
 	}
@@ -300,6 +323,7 @@ func (c *Crawler) coordinatorLoop(ctx context.Context, taskCh chan CrawlTask, di
 				inFlight--
 				updateQueueMetrics()
 			case <-ctx.Done():
+				drainInFlight()
 				saveQueue()
 				return
 			}
@@ -328,6 +352,7 @@ func (c *Crawler) coordinatorLoop(ctx context.Context, taskCh chan CrawlTask, di
 			case <-persistTicker.C:
 				flushVisited()
 			case <-ctx.Done():
+				drainInFlight()
 				saveQueue()
 				return
 			}
@@ -351,6 +376,7 @@ func (c *Crawler) coordinatorLoop(ctx context.Context, taskCh chan CrawlTask, di
 			case <-persistTicker.C:
 				flushVisited()
 			case <-ctx.Done():
+				drainInFlight()
 				saveQueue()
 				return
 			}
@@ -360,7 +386,11 @@ func (c *Crawler) coordinatorLoop(ctx context.Context, taskCh chan CrawlTask, di
 	// Normal completion — clear queue and mark complete
 	flushVisited()
 	if c.db != nil {
-		c.db.SaveQueuedTasks(nil) // clear queue
+		if c.sessionID > 0 {
+			c.db.SaveSessionQueuedTasks(c.sessionID, nil) // clear session queue
+		} else {
+			c.db.SaveQueuedTasks(nil) // clear global queue
+		}
 	}
 }
 

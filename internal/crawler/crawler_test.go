@@ -71,7 +71,7 @@ func TestCrawler_AllPagesReached(t *testing.T) {
 		SameDomain:     true,
 	}
 
-	c := NewCrawler(cfg, idx, metrics, nil)
+	c := NewCrawler(cfg, 0, idx, metrics, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -110,7 +110,7 @@ func TestCrawler_DepthLimit(t *testing.T) {
 		SameDomain:     true,
 	}
 
-	c := NewCrawler(cfg, idx, metrics, nil)
+	c := NewCrawler(cfg, 0, idx, metrics, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -140,7 +140,7 @@ func TestCrawler_NoDuplicates(t *testing.T) {
 		SameDomain:     true,
 	}
 
-	c := NewCrawler(cfg, idx, metrics, nil)
+	c := NewCrawler(cfg, 0, idx, metrics, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -197,7 +197,7 @@ func TestCrawler_SearchDuringCrawl(t *testing.T) {
 		SameDomain:     true,
 	}
 
-	c := NewCrawler(cfg, idx, metrics, nil)
+	c := NewCrawler(cfg, 0, idx, metrics, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -248,7 +248,7 @@ func TestCrawler_ContextCancellation(t *testing.T) {
 		SameDomain:     true,
 	}
 
-	c := NewCrawler(cfg, idx, metrics, nil)
+	c := NewCrawler(cfg, 0, idx, metrics, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
@@ -279,7 +279,7 @@ func TestCrawler_MetricsConsistency(t *testing.T) {
 		SameDomain:     true,
 	}
 
-	c := NewCrawler(cfg, idx, metrics, nil)
+	c := NewCrawler(cfg, 0, idx, metrics, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 

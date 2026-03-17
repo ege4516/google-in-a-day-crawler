@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -33,18 +34,38 @@ type CrawlConfig struct {
 
 func parseFlags() CrawlConfig {
 	cfg := CrawlConfig{}
-	flag.StringVar(&cfg.SeedURL, "seed", "", "Seed URL (optional; omit for dashboard-only mode)")
+	flag.StringVar(&cfg.SeedURL, "seed", "", "Seed URL(s), comma-separated for multiple (optional; omit for dashboard-only mode)")
 	flag.IntVar(&cfg.MaxDepth, "depth", 3, "Maximum crawl depth from seed")
 	flag.IntVar(&cfg.MaxURLs, "max-urls", 0, "Maximum total URLs to visit (0 = unlimited)")
 	flag.IntVar(&cfg.NumWorkers, "workers", 5, "Number of concurrent crawler workers")
 	flag.IntVar(&cfg.QueueSize, "queue-size", 10000, "Bounded task queue capacity")
 	flag.DurationVar(&cfg.RequestTimeout, "timeout", 10*time.Second, "HTTP request timeout")
 	flag.Int64Var(&cfg.MaxBodySize, "max-body", 1<<20, "Maximum response body size in bytes")
-	flag.BoolVar(&cfg.SameDomain, "same-domain", true, "Only crawl links on the seed domain")
+	flag.BoolVar(&cfg.SameDomain, "same-domain", true, "Only crawl links on the seed domain(s)")
 	flag.IntVar(&cfg.DashboardPort, "port", 8080, "Dashboard HTTP port")
 	flag.StringVar(&cfg.DataDir, "data", "data", "Directory for persistent storage")
 	flag.Parse()
 	return cfg
+}
+
+// parseSeeds splits comma-separated URLs and validates each one.
+func parseSeeds(raw string) ([]string, error) {
+	var seeds []string
+	for _, s := range strings.Split(raw, ",") {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		u, err := url.Parse(s)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+			return nil, fmt.Errorf("invalid seed URL %q (must be http or https)", s)
+		}
+		seeds = append(seeds, s)
+	}
+	if len(seeds) == 0 {
+		return nil, fmt.Errorf("no valid seed URLs provided")
+	}
+	return seeds, nil
 }
 
 func main() {
@@ -75,53 +96,10 @@ func main() {
 	// Create manager (owns index + metrics lifecycle)
 	manager := crawler.NewManager(ctx, db)
 
-	// Check for resumable state
-	if state, ok := manager.HasResumableState(); ok {
-		fmt.Println("Google-in-a-Day Crawler")
-		fmt.Printf("  Found interrupted crawl: %s (depth %d)\n", state.SeedURL, state.MaxDepth)
-		fmt.Print("  Resume previous crawl? [Y/n]: ")
-
-		var answer string
-		fmt.Scanln(&answer)
-		if answer == "" || answer == "y" || answer == "Y" || answer == "yes" {
-			// Restore index from DB
-			if err := manager.RestoreIndex(); err != nil {
-				log.Printf("Warning: failed to restore index: %v", err)
-			}
-
-			resumeCfg := crawler.Config{
-				SeedURL:        state.SeedURL,
-				MaxDepth:       state.MaxDepth,
-				NumWorkers:     state.NumWorkers,
-				QueueSize:      cfg.QueueSize,
-				RequestTimeout: cfg.RequestTimeout,
-				MaxBodySize:    cfg.MaxBodySize,
-				SameDomain:     state.SameDomain,
-			}
-
-			// Start dashboard in background
-			dash := dashboard.NewServer(cfg.DashboardPort, manager)
-			go func() {
-				if err := dash.Start(); err != nil {
-					log.Printf("Dashboard error: %v", err)
-				}
-			}()
-
-			fmt.Printf("  Resuming crawl...\n")
-			fmt.Printf("  Dashboard: http://localhost:%d\n\n", cfg.DashboardPort)
-
-			done, err := manager.ResumeCrawl(resumeCfg)
-			if err != nil {
-				log.Fatalf("Failed to resume crawl: %v", err)
-			}
-			<-done
-
-			fmt.Println()
-			fmt.Println("Crawl finished. Dashboard still running for search.")
-			fmt.Println("Press Ctrl+C to exit.")
-			<-sigCh
-			fmt.Println("Exiting.")
-			return
+	// Restore index from persisted data
+	if db != nil {
+		if err := manager.RestoreIndex(); err != nil {
+			log.Printf("Warning: failed to restore index: %v", err)
 		}
 	}
 
@@ -135,14 +113,21 @@ func main() {
 
 	if cfg.SeedURL != "" {
 		// Mode A: CLI-initiated crawl
-		seedParsed, err := url.Parse(cfg.SeedURL)
-		if err != nil || (seedParsed.Scheme != "http" && seedParsed.Scheme != "https") {
-			fmt.Fprintf(os.Stderr, "Error: invalid seed URL %q (must be http or https)\n", cfg.SeedURL)
+		seeds, err := parseSeeds(cfg.SeedURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 
 		fmt.Println("Google-in-a-Day Crawler")
-		fmt.Printf("  Seed:    %s\n", cfg.SeedURL)
+		if len(seeds) == 1 {
+			fmt.Printf("  Seed:    %s\n", seeds[0])
+		} else {
+			fmt.Printf("  Seeds:   %d URLs\n", len(seeds))
+			for i, s := range seeds {
+				fmt.Printf("    [%d] %s\n", i+1, s)
+			}
+		}
 		fmt.Printf("  Depth:   %d\n", cfg.MaxDepth)
 		fmt.Printf("  Workers: %d\n", cfg.NumWorkers)
 		fmt.Printf("  Queue:   %d\n", cfg.QueueSize)
@@ -150,7 +135,8 @@ func main() {
 		fmt.Println()
 
 		crawlerCfg := crawler.Config{
-			SeedURL:        cfg.SeedURL,
+			SeedURL:        seeds[0],
+			SeedURLs:       seeds,
 			MaxDepth:       cfg.MaxDepth,
 			MaxURLs:        cfg.MaxURLs,
 			NumWorkers:     cfg.NumWorkers,

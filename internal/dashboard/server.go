@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -60,6 +62,38 @@ func (s *Server) Start() error {
 
 // ---------- Page handler (single HTML template, tab-based) ----------
 
+// waitForAllCrawls waits up to 5 seconds for all active crawls to finish.
+func (s *Server) waitForAllCrawls() {
+	for _, id := range s.manager.ActiveSessionIDs() {
+		if done := s.manager.DoneByID(id); done != nil {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+			}
+		}
+	}
+}
+
+// parseSeedURLs splits a multi-line textarea input into valid seed URLs.
+func parseSeedURLs(raw string) []string {
+	lines := strings.Split(raw, "\n")
+	var seeds []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Prepend https:// if user typed a bare domain
+		if !strings.HasPrefix(line, "http://") && !strings.HasPrefix(line, "https://") {
+			line = "https://" + line
+		}
+		if u, err := url.Parse(line); err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" {
+			seeds = append(seeds, line)
+		}
+	}
+	return seeds
+}
+
 func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 	// Handle POST actions (create crawl, stop crawl, clear, resume)
 	if r.Method == http.MethodPost {
@@ -67,62 +101,91 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 		switch action {
 		case "stop":
 			s.manager.StopCrawl()
-		case "resume":
-			if state, ok := s.manager.HasResumableState(); ok {
-				s.manager.RestoreIndex()
-				cfg := crawler.Config{
-					SeedURL:        state.SeedURL,
-					MaxDepth:       state.MaxDepth,
-					NumWorkers:     state.NumWorkers,
-					QueueSize:      10000,
-					RequestTimeout: 10 * time.Second,
-					MaxBodySize:    1 << 20,
-					SameDomain:     state.SameDomain,
+			// Wait for all crawls to finish cleanup (goroutines call finishSession)
+			s.waitForAllCrawls()
+			// Fallback: mark any still-running sessions as stopped in DB
+			if db := s.manager.GetDB(); db != nil {
+				for _, id := range s.manager.ActiveSessionIDs() {
+					db.UpdateSessionStatus(id, "stopped")
 				}
-				s.manager.ResumeCrawl(cfg)
+			}
+		case "stop_crawl":
+			if id, err := strconv.ParseInt(r.FormValue("crawl_id"), 10, 64); err == nil {
+				s.manager.StopCrawlByID(id)
+				// Wait for goroutine to finish (it will call finishSession + cleanup)
+				done := s.manager.DoneByID(id)
+				if done != nil {
+					select {
+					case <-done:
+					case <-time.After(5 * time.Second):
+					}
+				}
+				// Ensure DB status is stopped (in case goroutine didn't finish in time)
+				if db := s.manager.GetDB(); db != nil {
+					db.UpdateSessionStatus(id, "stopped")
+				}
+			}
+			// Redirect to status tab so user sees the Resume button
+			http.Redirect(w, r, "/?tab=status", http.StatusSeeOther)
+			return
+		case "resume_crawl":
+			if id, err := strconv.ParseInt(r.FormValue("crawl_id"), 10, 64); err == nil {
+				_, _, err := s.manager.ResumeCrawlByID(id)
+				if err != nil {
+					log.Printf("resume error: %v", err)
+				}
 			}
 		case "clear":
 			if db := s.manager.GetDB(); db != nil {
 				db.DeleteCompletedCrawlSessions()
 			}
 		case "start":
-			seed := r.FormValue("seed")
-			if seed != "" {
+			seeds := parseSeedURLs(r.FormValue("seed"))
+			if len(seeds) > 0 {
 				depth := 3
 				if d, err := strconv.Atoi(r.FormValue("depth")); err == nil && d > 0 {
 					depth = d
 				}
 				workers := 5
-				if w, err := strconv.Atoi(r.FormValue("workers")); err == nil && w > 0 {
-					workers = w
+				if wv, err := strconv.Atoi(r.FormValue("workers")); err == nil && wv > 0 {
+					workers = wv
 				}
 				queueSize := 10000
 				if q, err := strconv.Atoi(r.FormValue("queue_size")); err == nil && q > 0 {
 					queueSize = q
 				}
 				maxURLs := 0
-				if m, err := strconv.Atoi(r.FormValue("max_urls")); err == nil && m > 0 {
-					maxURLs = m
+				if mv, err := strconv.Atoi(r.FormValue("max_urls")); err == nil && mv > 0 {
+					maxURLs = mv
 				}
 				sameDomain := r.FormValue("same_domain") == "on"
 
-				cfg := crawler.Config{
-					SeedURL:        seed,
-					MaxDepth:       depth,
-					MaxURLs:        maxURLs,
-					NumWorkers:     workers,
-					QueueSize:      queueSize,
-					RequestTimeout: 10 * time.Second,
-					MaxBodySize:    1 << 20,
-					SameDomain:     sameDomain,
+				// Each seed URL starts its own independent crawl
+				for _, seed := range seeds {
+					cfg := crawler.Config{
+						SeedURL:        seed,
+						MaxDepth:       depth,
+						MaxURLs:        maxURLs,
+						NumWorkers:     workers,
+						QueueSize:      queueSize,
+						RequestTimeout: 10 * time.Second,
+						MaxBodySize:    1 << 20,
+						SameDomain:     sameDomain,
+					}
+					_, _, err := s.manager.StartCrawl(cfg)
+					if err != nil {
+						log.Printf("error starting crawl for %s: %v", seed, err)
+					}
 				}
-				s.manager.StartCrawl(cfg)
 			}
 		}
-		// PRG redirect — preserve the current tab
+		// PRG redirect — stop actions go to status tab (for resume), others stay
 		tab := r.FormValue("tab")
 		if tab == "" {
 			tab = "create"
+		}
+		if action == "stop_crawl" || action == "stop" {
+			tab = "status"
 		}
 		http.Redirect(w, r, "/?tab="+tab, http.StatusSeeOther)
 		return
@@ -140,27 +203,27 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 
 	isRunning := s.manager.IsRunning()
 
-	// Check for resumable crawl
-	var resumeSeed string
-	resumeState, canResume := s.manager.HasResumableState()
-	if canResume && !isRunning {
-		resumeSeed = resumeState.SeedURL
-	}
-
 	// Load crawl sessions from DB
 	var sessions []storage.CrawlSession
 	// Update running sessions with live metrics
+	runningCrawls := s.manager.GetRunningCrawls()
 	if db := s.manager.GetDB(); db != nil {
-		sessions, _ = db.LoadAllCrawlSessions()
-		if isRunning {
-			activeID := s.manager.ActiveSessionID()
-			for i := range sessions {
-				if sessions[i].ID == activeID {
-					sessions[i].VisitedCount = snap.PagesProcessed
-					sessions[i].QueuedCount = snap.PagesQueued
-					sessions[i].IndexedCount = snap.IndexedDocs
-					sessions[i].ErrorCount = snap.PagesErrored
-				}
+		var err error
+		sessions, err = db.LoadAllCrawlSessions()
+		if err != nil {
+			log.Printf("Warning: failed to load crawl sessions: %v", err)
+		}
+		// Build a map of running crawl metrics by session ID
+		runningMap := make(map[int64]crawler.MetricsSnapshot)
+		for _, rc := range runningCrawls {
+			runningMap[rc.SessionID] = rc.Metrics
+		}
+		for i := range sessions {
+			if m, ok := runningMap[sessions[i].ID]; ok {
+				sessions[i].VisitedCount = m.PagesProcessed
+				sessions[i].QueuedCount = m.PagesQueued
+				sessions[i].IndexedCount = m.IndexedDocs
+				sessions[i].ErrorCount = m.PagesErrored
 			}
 		}
 	}
@@ -180,29 +243,27 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := struct {
-		Tab          string
-		Metrics      crawler.MetricsSnapshot
-		Query        string
-		Results      []index.SearchResult
-		IsRunning    bool
-		CanResume    bool
-		ResumeSeed   string
-		Sessions     []storage.CrawlSession
-		TotalVisited int64
-		TotalWords   int64
-		ActiveCount  int
-		TotalCount   int
+		Tab           string
+		Metrics       crawler.MetricsSnapshot
+		Query         string
+		Results       []index.SearchResult
+		IsRunning     bool
+		RunningCrawls []crawler.RunningCrawlInfo
+		Sessions      []storage.CrawlSession
+		TotalVisited  int64
+		TotalWords    int64
+		ActiveCount   int
+		TotalCount    int
 	}{
-		Tab:          tab,
-		Metrics:      snap,
-		IsRunning:    isRunning,
-		CanResume:    canResume && !isRunning,
-		ResumeSeed:   resumeSeed,
-		Sessions:     sessions,
-		TotalVisited: totalVisited,
-		TotalWords:   totalWords,
-		ActiveCount:  activeCount,
-		TotalCount:   totalCount,
+		Tab:           tab,
+		Metrics:       snap,
+		IsRunning:     isRunning,
+		RunningCrawls: runningCrawls,
+		Sessions:      sessions,
+		TotalVisited:  totalVisited,
+		TotalWords:    totalWords,
+		ActiveCount:   activeCount,
+		TotalCount:    totalCount,
 	}
 
 	q := r.URL.Query().Get("q")
@@ -213,6 +274,7 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	s.tmpl.Execute(w, data)
 }
 
@@ -333,15 +395,27 @@ func (s *Server) handleCrawlByID(w http.ResponseWriter, r *http.Request) {
 
 	// POST /api/crawls/{id}/stop
 	if len(parts) >= 2 && parts[1] == "stop" && r.Method == http.MethodPost {
-		activeID := s.manager.ActiveSessionID()
-		if activeID == id && s.manager.IsRunning() {
-			s.manager.StopCrawl()
+		if s.manager.StopCrawlByID(id) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]string{"status": "stopped"})
 		} else {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			json.NewEncoder(w).Encode(map[string]string{"error": "crawl is not running"})
+		}
+		return
+	}
+
+	// POST /api/crawls/{id}/resume
+	if len(parts) >= 2 && parts[1] == "resume" && r.Method == http.MethodPost {
+		_, _, err := s.manager.ResumeCrawlByID(id)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"status": "resumed", "id": id})
 		}
 		return
 	}
@@ -456,7 +530,6 @@ const dashboardHTML = `<!DOCTYPE html>
 <head>
     <meta charset="utf-8">
     <title>Google in a Day</title>
-    {{if .IsRunning}}<meta http-equiv="refresh" content="2;url=?tab={{.Tab}}">{{end}}
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #0d1117; color: #c9d1d9; }
@@ -491,8 +564,9 @@ const dashboardHTML = `<!DOCTYPE html>
         .field label { display: block; color: #8b949e; font-size: 0.8em; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
         .field input[type="text"],
         .field input[type="number"],
-        .field input[type="url"] { width: 100%; padding: 10px 14px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; font-size: 1em; }
-        .field input:focus { border-color: #58a6ff; outline: none; }
+        .field input[type="url"],
+        .field textarea { width: 100%; padding: 10px 14px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; font-size: 1em; font-family: inherit; }
+        .field input:focus, .field textarea:focus { border-color: #58a6ff; outline: none; }
         .field .hint { font-size: 0.72em; color: #6e7681; margin-top: 3px; }
         .inline { display: flex; gap: 14px; }
         .inline .field { flex: 1; }
@@ -505,6 +579,10 @@ const dashboardHTML = `<!DOCTYPE html>
         .btn-primary:hover { background: #2ea043; }
         .btn-danger { padding: 8px 16px; background: #da3633; border: 1px solid #f85149; border-radius: 6px; color: #fff; font-size: 0.9em; cursor: pointer; }
         .btn-danger:hover { background: #f85149; }
+        .btn-danger-sm { padding: 4px 10px; background: #da3633; border: 1px solid #f85149; border-radius: 6px; color: #fff; font-size: 0.75em; cursor: pointer; }
+        .btn-danger-sm:hover { background: #f85149; }
+        .btn-resume-sm { padding: 4px 10px; background: #1f6feb; border: 1px solid #388bfd; border-radius: 6px; color: #fff; font-size: 0.75em; cursor: pointer; }
+        .btn-resume-sm:hover { background: #388bfd; }
 
         /* Search */
         .search-box { display: flex; gap: 8px; margin-bottom: 20px; }
@@ -514,11 +592,13 @@ const dashboardHTML = `<!DOCTYPE html>
         .search-box button:hover { background: #2ea043; }
 
         /* Search results */
-        .result { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 14px; margin-bottom: 8px; }
-        .result .url { color: #58a6ff; font-size: 0.85em; word-break: break-all; }
-        .result .title { font-weight: bold; margin: 4px 0; }
-        .result .meta { color: #8b949e; font-size: 0.8em; }
-        .result .meta span { margin-right: 12px; }
+        .result { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 14px; margin-bottom: 8px; overflow: hidden; }
+        .result .url { color: #58a6ff; font-size: 0.85em; overflow-wrap: break-word; word-break: break-all; }
+        .result .url a { color: #58a6ff; text-decoration: none; }
+        .result .url a:hover { text-decoration: underline; }
+        .result .title { font-weight: bold; margin: 4px 0; overflow-wrap: break-word; }
+        .result .meta { color: #8b949e; font-size: 0.8em; overflow-wrap: break-word; }
+        .result .meta span { margin-right: 12px; display: inline-block; max-width: 100%; overflow-wrap: break-word; word-break: break-all; }
 
         /* Metrics grid */
         .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 20px; }
@@ -530,8 +610,8 @@ const dashboardHTML = `<!DOCTYPE html>
 
         /* Sessions table */
         .sessions-table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
-        .sessions-table th { text-align: left; color: #8b949e; font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.5px; padding: 8px 10px; border-bottom: 1px solid #30363d; }
-        .sessions-table td { padding: 10px; border-bottom: 1px solid #21262d; vertical-align: top; }
+        .sessions-table th { text-align: left; color: #8b949e; font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.5px; padding: 10px 12px; border-bottom: 1px solid #30363d; }
+        .sessions-table td { padding: 10px 12px; border-bottom: 1px solid #21262d; vertical-align: top; }
         .sessions-table tr:hover { background: #161b2299; }
         .status-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.75em; font-weight: bold; }
         .status-badge.running { background: #1f6feb33; color: #58a6ff; }
@@ -539,7 +619,16 @@ const dashboardHTML = `<!DOCTYPE html>
         .status-badge.stopped { background: #da363333; color: #f85149; }
         .status-badge.failed { background: #da363333; color: #f85149; }
         .status-badge.queued { background: #30363d; color: #8b949e; }
-        .sessions-table .url-cell { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #58a6ff; }
+        .sessions-table .url-cell { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #58a6ff; }
+        .sessions-table .url-cell a { color: #58a6ff; text-decoration: none; }
+        .sessions-table .url-cell a:hover { text-decoration: underline; }
+        .sessions-table .meta { color: #8b949e; font-size: 0.8em; line-height: 1.6; }
+        .sessions-table .meta span { white-space: nowrap; }
+        .sessions-table .stat-group { display: flex; gap: 12px; font-size: 0.9em; }
+        .sessions-table .stat-group .stat { display: flex; flex-direction: column; align-items: center; }
+        .sessions-table .stat-group .stat .num { font-weight: bold; font-size: 1.1em; }
+        .sessions-table .stat-group .stat .lbl { font-size: 0.7em; color: #8b949e; text-transform: uppercase; }
+        .sessions-table .time-cell { font-size: 0.78em; color: #8b949e; white-space: nowrap; line-height: 1.6; }
 
         /* Resume banner */
         .resume-banner { background: #1f6feb22; border: 1px solid #1f6feb; border-radius: 6px; padding: 14px 20px; margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between; }
@@ -553,6 +642,13 @@ const dashboardHTML = `<!DOCTYPE html>
 
         .empty-state { text-align: center; color: #8b949e; padding: 48px 20px; }
         .empty-state p { margin-bottom: 8px; }
+
+        /* Running crawl card */
+        .running-crawl-card { background: #161b22; border: 1px solid #1f6feb55; border-radius: 8px; padding: 16px; margin-bottom: 14px; }
+        .running-crawl-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+        .running-crawl-header .seed-url { color: #58a6ff; font-size: 0.85em; overflow-wrap: break-word; word-break: break-all; max-width: 70%; }
+        .running-crawl-header .seed-url a { color: #58a6ff; text-decoration: none; }
+        .running-crawl-header .seed-url a:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
@@ -586,11 +682,11 @@ const dashboardHTML = `<!DOCTYPE html>
         </div>
         <span class="summary-spacer"></span>
         {{if .IsRunning}}
-            <span style="color: #58a6ff; font-size: 0.85em;"><span class="running-dot"></span>Crawling...</span>
+            <span style="color: #58a6ff; font-size: 0.85em;"><span class="running-dot"></span>{{.ActiveCount}} Crawling...</span>
             <form method="POST" action="/" style="display:inline">
                 <input type="hidden" name="action" value="stop">
                 <input type="hidden" name="tab" value="{{.Tab}}">
-                <button type="submit" class="btn-danger">Stop</button>
+                <button type="submit" class="btn-danger">Stop All</button>
             </form>
         {{end}}
         <form method="POST" action="/" style="display:inline">
@@ -601,17 +697,6 @@ const dashboardHTML = `<!DOCTYPE html>
     </div>
 
     <div class="main">
-
-    {{if .CanResume}}
-    <div class="resume-banner">
-        <span class="info">Interrupted crawl found: <strong>{{.ResumeSeed}}</strong></span>
-        <form method="POST" action="/" style="display:inline">
-            <input type="hidden" name="action" value="resume">
-            <input type="hidden" name="tab" value="{{.Tab}}">
-            <button type="submit" class="resume-btn">Resume Crawl</button>
-        </form>
-    </div>
-    {{end}}
 
     <!-- ========== SEARCH TAB ========== -->
     {{if eq .Tab "search"}}
@@ -627,12 +712,12 @@ const dashboardHTML = `<!DOCTYPE html>
         <p style="color: #8b949e; margin-bottom: 12px;">{{len .Results}} results for "{{.Query}}"</p>
         {{range .Results}}
         <div class="result">
-            <div class="url">{{.URL}}</div>
+            <div class="url"><a href="{{.URL}}" target="_blank" rel="noopener">{{.URL}}</a></div>
             <div class="title">{{if .Title}}{{.Title}}{{else}}(no title){{end}}</div>
             <div class="meta">
                 <span>Score: {{printf "%.2f" .Score}}</span>
                 <span>Depth: {{.Depth}}</span>
-                <span>Origin: {{if .OriginURL}}{{.OriginURL}}{{else}}(seed){{end}}</span>
+                <span>Origin: {{if .OriginURL}}<a href="{{.OriginURL}}" target="_blank" rel="noopener" style="color:#8b949e;">{{.OriginURL}}</a>{{else}}(seed){{end}}</span>
             </div>
         </div>
         {{end}}
@@ -652,88 +737,80 @@ const dashboardHTML = `<!DOCTYPE html>
     {{if eq .Tab "create"}}
     <div class="card" style="max-width: 600px; margin: 20px auto;">
         <h2>Create New Crawler</h2>
-        {{if .IsRunning}}
-        <p style="color: #f0883e; margin-bottom: 16px;">A crawl is currently running. Stop it before starting a new one.</p>
-        {{end}}
         <form method="POST" action="/">
             <input type="hidden" name="action" value="start">
             <input type="hidden" name="tab" value="create">
             <div class="field">
-                <label>Origin URL</label>
-                <input type="url" name="seed" placeholder="https://example.com" required {{if .IsRunning}}disabled{{end}}>
-                <div class="hint">The starting URL for the crawl.</div>
+                <label>Seed URLs</label>
+                <textarea name="seed" rows="3" placeholder="https://example.com&#10;https://another-site.com&#10;(one URL per line)" required></textarea>
+                <div class="hint">Enter one or more URLs, one per line. Each URL starts its own independent crawl.</div>
             </div>
             <div class="inline">
                 <div class="field">
                     <label>Max Depth</label>
-                    <input type="number" name="depth" value="3" min="0" max="50" {{if .IsRunning}}disabled{{end}}>
+                    <input type="number" name="depth" value="3" min="0" max="50">
                     <div class="hint">Graph traversal distance (hops) from origin.</div>
                 </div>
                 <div class="field">
                     <label>Max URLs to Visit</label>
-                    <input type="number" name="max_urls" value="0" min="0" {{if .IsRunning}}disabled{{end}}>
+                    <input type="number" name="max_urls" value="0" min="0">
                     <div class="hint">Total page count cap. 0 = unlimited.</div>
                 </div>
             </div>
             <div class="inline">
                 <div class="field">
                     <label>Workers</label>
-                    <input type="number" name="workers" value="5" min="1" max="50" {{if .IsRunning}}disabled{{end}}>
+                    <input type="number" name="workers" value="5" min="1" max="50">
                     <div class="hint">Concurrent crawler goroutines.</div>
                 </div>
                 <div class="field">
                     <label>Queue Capacity</label>
-                    <input type="number" name="queue_size" value="10000" min="100" max="100000" {{if .IsRunning}}disabled{{end}}>
+                    <input type="number" name="queue_size" value="10000" min="100" max="100000">
                     <div class="hint">Bounded task queue size (back-pressure).</div>
                 </div>
             </div>
             <div class="checkbox-field">
-                <input type="checkbox" name="same_domain" id="same_domain" checked {{if .IsRunning}}disabled{{end}}>
+                <input type="checkbox" name="same_domain" id="same_domain" checked>
                 <label for="same_domain">Same domain only</label>
             </div>
-            <button type="submit" class="btn-primary" {{if .IsRunning}}disabled style="opacity:0.5"{{end}}>Start Crawler</button>
+            <button type="submit" class="btn-primary">Start Crawler</button>
         </form>
     </div>
 
-    {{if .IsRunning}}
-    <!-- Live metrics while running -->
-    <div style="max-width: 600px; margin: 0 auto;">
-        <div class="grid">
-            <div class="metric-card">
-                <div class="label">Pages Processed</div>
-                <div class="value">{{.Metrics.PagesProcessed}}</div>
+    <!-- Live metrics for each running crawl -->
+    <div class="running-crawls-container" style="max-width: 600px; margin: 0 auto;">
+        {{range .RunningCrawls}}
+        <div class="running-crawl-card">
+            <div class="running-crawl-header">
+                <span class="seed-url"><span class="running-dot"></span><a href="{{.SeedURL}}" target="_blank" rel="noopener">{{.SeedURL}}</a></span>
+                <form method="POST" action="/" style="display:inline">
+                    <input type="hidden" name="action" value="stop_crawl">
+                    <input type="hidden" name="crawl_id" value="{{.SessionID}}">
+                    <input type="hidden" name="tab" value="create">
+                    <button type="submit" class="btn-danger-sm">Stop</button>
+                </form>
             </div>
-            <div class="metric-card">
-                <div class="label">Pages Queued</div>
-                <div class="value">{{.Metrics.PagesQueued}}</div>
-            </div>
-            <div class="metric-card">
-                <div class="label">Indexed Docs</div>
-                <div class="value green">{{.Metrics.IndexedDocs}}</div>
-            </div>
-            <div class="metric-card">
-                <div class="label">Errors</div>
-                <div class="value red">{{.Metrics.PagesErrored}}</div>
-            </div>
-            <div class="metric-card">
-                <div class="label">Active Workers</div>
-                <div class="value">{{.Metrics.ActiveWorkers}}</div>
-            </div>
-            <div class="metric-card">
-                <div class="label">Queue Depth</div>
-                <div class="value">{{.Metrics.QueueDepth}}</div>
-            </div>
-            <div class="metric-card">
-                <div class="label">Overflow Buffer</div>
-                <div class="value {{if .Metrics.BackPressureActive}}red{{end}}">{{.Metrics.OverflowSize}}</div>
-            </div>
-            <div class="metric-card">
-                <div class="label">Uptime</div>
-                <div class="value">{{.Metrics.UptimeStr}}</div>
+            <div class="grid">
+                <div class="metric-card">
+                    <div class="label">Pages Processed</div>
+                    <div class="value">{{.Metrics.PagesProcessed}}</div>
+                </div>
+                <div class="metric-card">
+                    <div class="label">Indexed Docs</div>
+                    <div class="value green">{{.Metrics.IndexedDocs}}</div>
+                </div>
+                <div class="metric-card">
+                    <div class="label">Errors</div>
+                    <div class="value red">{{.Metrics.PagesErrored}}</div>
+                </div>
+                <div class="metric-card">
+                    <div class="label">Uptime</div>
+                    <div class="value">{{.Metrics.UptimeStr}}</div>
+                </div>
             </div>
         </div>
+        {{end}}
     </div>
-    {{end}}
     {{end}}
 
     <!-- ========== CRAWLER STATUS TAB ========== -->
@@ -741,41 +818,60 @@ const dashboardHTML = `<!DOCTYPE html>
     <h2 style="color: #c9d1d9; margin-bottom: 16px;">Crawler Sessions</h2>
 
     {{if .Sessions}}
-    <div class="card" style="padding: 0; overflow-x: auto;">
+    <div class="card" style="padding: 0;">
         <table class="sessions-table">
             <thead>
                 <tr>
-                    <th>ID</th>
                     <th>Origin URL</th>
                     <th>Status</th>
-                    <th>Depth</th>
-                    <th>Max URLs</th>
-                    <th>Workers</th>
-                    <th>Queue</th>
-                    <th>Visited</th>
-                    <th>Indexed</th>
-                    <th>Errors</th>
-                    <th>Reason</th>
-                    <th>Started</th>
-                    <th>Finished</th>
+                    <th>Config</th>
+                    <th>Stats</th>
+                    <th>Time</th>
+                    <th>Action</th>
                 </tr>
             </thead>
             <tbody>
             {{range .Sessions}}
                 <tr>
-                    <td>{{.ID}}</td>
-                    <td class="url-cell" title="{{.OriginURL}}">{{.OriginURL}}</td>
-                    <td><span class="status-badge {{.Status}}">{{.Status}}</span></td>
-                    <td>{{.MaxDepth}}</td>
-                    <td>{{if eq .MaxURLs 0}}&infin;{{else}}{{.MaxURLs}}{{end}}</td>
-                    <td>{{.NumWorkers}}</td>
-                    <td>{{.QueueSize}}</td>
-                    <td>{{.VisitedCount}}</td>
-                    <td>{{.IndexedCount}}</td>
-                    <td>{{.ErrorCount}}</td>
-                    <td>{{if .StopReason}}{{.StopReason}}{{else}}-{{end}}</td>
-                    <td style="white-space:nowrap; font-size:0.8em;">{{.StartedAt}}</td>
-                    <td style="white-space:nowrap; font-size:0.8em;">{{if .FinishedAt}}{{.FinishedAt}}{{else}}-{{end}}</td>
+                    <td class="url-cell" title="{{.OriginURL}}"><a href="{{.OriginURL}}" target="_blank" rel="noopener">{{.OriginURL}}</a></td>
+                    <td>
+                        <span class="status-badge {{.Status}}">{{.Status}}</span>
+                        {{if .StopReason}}<div class="meta" style="margin-top:4px;">{{.StopReason}}</div>{{end}}
+                    </td>
+                    <td class="meta">
+                        <span>depth {{.MaxDepth}}</span> &middot;
+                        <span>{{.NumWorkers}}w</span> &middot;
+                        <span>q{{.QueueSize}}</span>
+                        {{if gt .MaxURLs 0}} &middot; <span>max {{.MaxURLs}}</span>{{end}}
+                    </td>
+                    <td>
+                        <div class="stat-group">
+                            <div class="stat"><span class="num">{{.VisitedCount}}</span><span class="lbl">visited</span></div>
+                            <div class="stat"><span class="num" style="color:#3fb950;">{{.IndexedCount}}</span><span class="lbl">indexed</span></div>
+                            <div class="stat"><span class="num" style="color:#f85149;">{{.ErrorCount}}</span><span class="lbl">errors</span></div>
+                        </div>
+                    </td>
+                    <td class="time-cell">
+                        {{.StartedAt}}
+                        {{if .FinishedAt}}<br>{{.FinishedAt}}{{end}}
+                    </td>
+                    <td>
+                        {{if eq .Status "running"}}
+                        <form method="POST" action="/" style="display:inline">
+                            <input type="hidden" name="action" value="stop_crawl">
+                            <input type="hidden" name="crawl_id" value="{{.ID}}">
+                            <input type="hidden" name="tab" value="status">
+                            <button type="submit" class="btn-danger-sm">Stop</button>
+                        </form>
+                        {{else if eq .Status "stopped"}}
+                        <form method="POST" action="/" style="display:inline">
+                            <input type="hidden" name="action" value="resume_crawl">
+                            <input type="hidden" name="crawl_id" value="{{.ID}}">
+                            <input type="hidden" name="tab" value="status">
+                            <button type="submit" class="btn-resume-sm">Resume</button>
+                        </form>
+                        {{else}}-{{end}}
+                    </td>
                 </tr>
             {{end}}
             </tbody>
@@ -790,5 +886,57 @@ const dashboardHTML = `<!DOCTYPE html>
     {{end}}
 
     </div>
+
+    <script>
+    (function() {
+        var isRunning = {{if .IsRunning}}true{{else}}false{{end}};
+        var currentTab = "{{.Tab}}";
+        if (!isRunning) return;
+
+        var pollInterval = 2000;
+        var timer = setInterval(function() {
+            fetch("/?tab=" + currentTab + "&_t=" + Date.now(), {headers: {"Accept": "text/html", "Cache-Control": "no-cache"}})
+                .then(function(resp) { return resp.text(); })
+                .then(function(html) {
+                    var parser = new DOMParser();
+                    var doc = parser.parseFromString(html, "text/html");
+
+                    // Update summary strip
+                    var newStrip = doc.querySelector(".summary-strip");
+                    var oldStrip = document.querySelector(".summary-strip");
+                    if (newStrip && oldStrip) {
+                        oldStrip.innerHTML = newStrip.innerHTML;
+                    }
+
+                    // On status and search tabs: replace the entire .main content
+                    // (no forms to preserve on these tabs)
+                    if (currentTab === "status" || currentTab === "search") {
+                        var newMain = doc.querySelector(".main");
+                        var oldMain = document.querySelector(".main");
+                        if (newMain && oldMain) {
+                            oldMain.innerHTML = newMain.innerHTML;
+                        }
+                    }
+
+                    // On create tab: update running crawl cards only (not the form)
+                    if (currentTab === "create") {
+                        var container = document.querySelector(".running-crawls-container");
+                        var newContainer = doc.querySelector(".running-crawls-container");
+                        if (container && newContainer) {
+                            container.innerHTML = newContainer.innerHTML;
+                        }
+                    }
+
+                    // Check if crawling stopped — if no running-dot in fresh HTML, stop polling
+                    var stillRunning = doc.querySelector(".running-dot");
+                    if (!stillRunning) {
+                        clearInterval(timer);
+                        location.reload();
+                    }
+                })
+                .catch(function() { /* ignore fetch errors, will retry */ });
+        }, pollInterval);
+    })();
+    </script>
 </body>
 </html>`

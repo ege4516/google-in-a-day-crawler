@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -32,22 +33,23 @@ type QueuedTask struct {
 
 // CrawlSession represents a historical crawl record.
 type CrawlSession struct {
-	ID           int64  `json:"id"`
-	OriginURL    string `json:"origin_url"`
-	MaxDepth     int    `json:"max_depth"`
-	MaxURLs      int    `json:"max_urls"`
-	NumWorkers   int    `json:"num_workers"`
-	QueueSize    int    `json:"queue_size"`
-	SameDomain   bool   `json:"same_domain"`
-	Status       string `json:"status"` // queued, running, completed, stopped, failed
-	VisitedCount int64  `json:"visited_count"`
-	QueuedCount  int64  `json:"queued_count"`
-	IndexedCount int64  `json:"indexed_count"`
-	ErrorCount   int64  `json:"error_count"`
-	StopReason   string `json:"stop_reason,omitempty"`
-	ErrorMessage string `json:"error_message,omitempty"`
-	StartedAt    string `json:"started_at"`
-	FinishedAt   string `json:"finished_at,omitempty"`
+	ID              int64  `json:"id"`
+	OriginURL       string `json:"origin_url"`
+	MaxDepth        int    `json:"max_depth"`
+	MaxURLs         int    `json:"max_urls"`
+	NumWorkers      int    `json:"num_workers"`
+	QueueSize       int    `json:"queue_size"`
+	SameDomain      bool   `json:"same_domain"`
+	Status          string `json:"status"` // queued, running, completed, stopped, failed
+	VisitedCount    int64  `json:"visited_count"`
+	QueuedCount     int64  `json:"queued_count"`
+	IndexedCount    int64  `json:"indexed_count"`
+	ErrorCount      int64  `json:"error_count"`
+	StopReason      string `json:"stop_reason,omitempty"`
+	ErrorMessage    string `json:"error_message,omitempty"`
+	StartedAt       string `json:"started_at"`
+	FinishedAt      string `json:"finished_at,omitempty"`
+	SavedQueueCount int64  `json:"saved_queue_count"`
 }
 
 // Open creates or opens a SQLite database at the given path.
@@ -57,7 +59,10 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 
-	conn, err := sql.Open("sqlite", path+"?_journal_mode=WAL&_busy_timeout=5000")
+	// Use _pragma DSN params so every pooled connection gets the same settings.
+	// WAL allows concurrent reads while writing. busy_timeout waits instead of failing.
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -139,6 +144,31 @@ func (db *DB) migrate() error {
 	);
 	`
 	_, err := db.conn.Exec(schema)
+	if err != nil {
+		return err
+	}
+
+	// Per-session resume migration (idempotent).
+	alterStmts := []string{
+		`ALTER TABLE queue ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE crawl_sessions ADD COLUMN saved_queue_count INTEGER NOT NULL DEFAULT 0`,
+	}
+	for _, stmt := range alterStmts {
+		_, err := db.conn.Exec(stmt)
+		if err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			// Ignore "duplicate column" — means column already exists.
+			return err
+		}
+	}
+
+	_, err = db.conn.Exec(`
+		CREATE TABLE IF NOT EXISTS session_visited_urls (
+			session_id INTEGER NOT NULL,
+			url        TEXT NOT NULL,
+			PRIMARY KEY (session_id, url)
+		);
+		CREATE INDEX IF NOT EXISTS idx_queue_session ON queue(session_id);
+	`)
 	return err
 }
 
@@ -391,7 +421,7 @@ func (db *DB) LoadAllCrawlSessions() ([]CrawlSession, error) {
 	rows, err := db.conn.Query(`
 		SELECT id, origin_url, max_depth, max_urls, num_workers, queue_size, same_domain,
 		       status, visited_count, queued_count, indexed_count, error_count,
-		       stop_reason, error_message, started_at, finished_at
+		       stop_reason, error_message, started_at, finished_at, saved_queue_count
 		FROM crawl_sessions ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
@@ -405,7 +435,7 @@ func (db *DB) LoadAllCrawlSessions() ([]CrawlSession, error) {
 		if err := rows.Scan(&s.ID, &s.OriginURL, &s.MaxDepth, &s.MaxURLs, &s.NumWorkers,
 			&s.QueueSize, &sameDomain, &s.Status, &s.VisitedCount, &s.QueuedCount,
 			&s.IndexedCount, &s.ErrorCount, &s.StopReason, &s.ErrorMessage,
-			&s.StartedAt, &s.FinishedAt); err != nil {
+			&s.StartedAt, &s.FinishedAt, &s.SavedQueueCount); err != nil {
 			return nil, err
 		}
 		s.SameDomain = sameDomain != 0
@@ -421,12 +451,12 @@ func (db *DB) LoadCrawlSession(id int64) (*CrawlSession, error) {
 	err := db.conn.QueryRow(`
 		SELECT id, origin_url, max_depth, max_urls, num_workers, queue_size, same_domain,
 		       status, visited_count, queued_count, indexed_count, error_count,
-		       stop_reason, error_message, started_at, finished_at
+		       stop_reason, error_message, started_at, finished_at, saved_queue_count
 		FROM crawl_sessions WHERE id = ?`, id).
 		Scan(&s.ID, &s.OriginURL, &s.MaxDepth, &s.MaxURLs, &s.NumWorkers,
 			&s.QueueSize, &sameDomain, &s.Status, &s.VisitedCount, &s.QueuedCount,
 			&s.IndexedCount, &s.ErrorCount, &s.StopReason, &s.ErrorMessage,
-			&s.StartedAt, &s.FinishedAt)
+			&s.StartedAt, &s.FinishedAt, &s.SavedQueueCount)
 	if err != nil {
 		return nil, err
 	}
@@ -434,8 +464,12 @@ func (db *DB) LoadCrawlSession(id int64) (*CrawlSession, error) {
 	return &s, nil
 }
 
-// DeleteCompletedCrawlSessions removes all non-running sessions.
+// DeleteCompletedCrawlSessions removes all non-running sessions and their resume data.
 func (db *DB) DeleteCompletedCrawlSessions() error {
+	_, _ = db.conn.Exec(`DELETE FROM queue WHERE session_id IN
+		(SELECT id FROM crawl_sessions WHERE status NOT IN ('running', 'queued'))`)
+	_, _ = db.conn.Exec(`DELETE FROM session_visited_urls WHERE session_id IN
+		(SELECT id FROM crawl_sessions WHERE status NOT IN ('running', 'queued'))`)
 	_, err := db.conn.Exec(`DELETE FROM crawl_sessions WHERE status NOT IN ('running', 'queued')`)
 	return err
 }
@@ -444,6 +478,123 @@ func (db *DB) DeleteCompletedCrawlSessions() error {
 func (db *DB) CountWordTokens() (int64, error) {
 	var count int64
 	err := db.conn.QueryRow(`SELECT COUNT(DISTINCT token) FROM postings`).Scan(&count)
+	return count, err
+}
+
+// --- Per-session resume methods ---
+
+// SaveSessionQueuedTasks persists queue tasks scoped to a session.
+func (db *DB) SaveSessionQueuedTasks(sessionID int64, tasks []QueuedTask) error {
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM queue WHERE session_id = ?`, sessionID); err != nil {
+		return err
+	}
+
+	stmt, err := tx.Prepare(`INSERT INTO queue (url, origin_url, depth, session_id) VALUES (?, ?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, t := range tasks {
+		if _, err := stmt.Exec(t.URL, t.OriginURL, t.Depth, sessionID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// LoadSessionQueuedTasks loads the persisted queue for a specific session.
+func (db *DB) LoadSessionQueuedTasks(sessionID int64) ([]QueuedTask, error) {
+	rows, err := db.conn.Query(`SELECT url, origin_url, depth FROM queue WHERE session_id = ? ORDER BY id`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tasks []QueuedTask
+	for rows.Next() {
+		var t QueuedTask
+		if err := rows.Scan(&t.URL, &t.OriginURL, &t.Depth); err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, t)
+	}
+	return tasks, rows.Err()
+}
+
+// AddSessionVisitedURLs marks multiple URLs as visited for a specific session.
+func (db *DB) AddSessionVisitedURLs(sessionID int64, urls []string) error {
+	if len(urls) == 0 {
+		return nil
+	}
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO session_visited_urls (session_id, url) VALUES (?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, u := range urls {
+		if _, err := stmt.Exec(sessionID, u); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// LoadSessionVisitedURLs returns the set of visited URLs for a specific session.
+func (db *DB) LoadSessionVisitedURLs(sessionID int64) (map[string]bool, error) {
+	rows, err := db.conn.Query(`SELECT url FROM session_visited_urls WHERE session_id = ?`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	visited := make(map[string]bool)
+	for rows.Next() {
+		var u string
+		if err := rows.Scan(&u); err != nil {
+			return nil, err
+		}
+		visited[u] = true
+	}
+	return visited, rows.Err()
+}
+
+// ClearSessionResumeData removes queue and visited data for a session.
+func (db *DB) ClearSessionResumeData(sessionID int64) error {
+	_, _ = db.conn.Exec(`DELETE FROM queue WHERE session_id = ?`, sessionID)
+	_, err := db.conn.Exec(`DELETE FROM session_visited_urls WHERE session_id = ?`, sessionID)
+	return err
+}
+
+// UpdateSessionStatus updates the status of a crawl session.
+func (db *DB) UpdateSessionStatus(id int64, status string) error {
+	_, err := db.conn.Exec(`UPDATE crawl_sessions SET status = ?, finished_at = '' WHERE id = ?`, status, id)
+	return err
+}
+
+// UpdateSessionSavedQueueCount records how many queue tasks were saved for resume.
+func (db *DB) UpdateSessionSavedQueueCount(id int64, count int64) error {
+	_, err := db.conn.Exec(`UPDATE crawl_sessions SET saved_queue_count = ? WHERE id = ?`, count, id)
+	return err
+}
+
+// CountSessionQueueTasks returns the number of saved queue tasks for a session.
+func (db *DB) CountSessionQueueTasks(sessionID int64) (int64, error) {
+	var count int64
+	err := db.conn.QueryRow(`SELECT COUNT(*) FROM queue WHERE session_id = ?`, sessionID).Scan(&count)
 	return count, err
 }
 
