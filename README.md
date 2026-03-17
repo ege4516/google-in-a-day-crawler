@@ -143,10 +143,10 @@ Each crawl is tracked as a session with status: `queued` → `running` → `comp
 make build          # or: go build -o crawler ./cmd/crawler
 
 # Run with a seed URL
-./crawler -seed https://go.dev -depth 2
-
+make run            # or ./crawler (for Linux and MacOS) 
+                    # or .\crawler.exe (for Windows)        
 # Run in dashboard-only mode
-./crawler
+./crawler     #.\crawler.exe (for Windows) 
 
 # Open the dashboard
 # http://localhost:8080

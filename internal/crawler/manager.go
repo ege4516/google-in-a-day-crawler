@@ -174,10 +174,11 @@ func (m *Manager) StartCrawl(cfg Config) (int64, <-chan struct{}, error) {
 
 	crawlCtx, cancelFn := context.WithCancel(m.parentCtx)
 
-	// Create session record
+	// Create session record (falls back to in-memory ID when DB is nil)
 	sessionID := m.createSession(cfg, "running")
 	if sessionID == 0 {
-		return 0, nil, errors.New("failed to create crawl session in database")
+		m.nextID++
+		sessionID = m.nextID
 	}
 
 	ac := &activeCrawl{

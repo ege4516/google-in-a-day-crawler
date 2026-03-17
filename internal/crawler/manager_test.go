@@ -145,7 +145,11 @@ func TestManager_StopCrawl(t *testing.T) {
 	// Slow server to ensure crawl is still running when we stop it
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(5 * time.Second)
+		select {
+		case <-time.After(5 * time.Second):
+		case <-r.Context().Done():
+			return
+		}
 		w.Header().Set("Content-Type", "text/html")
 		fmt.Fprint(w, `<html><body>Slow page</body></html>`)
 	})
@@ -189,7 +193,11 @@ func TestManager_StopCrawlByID(t *testing.T) {
 	makeSlow := func() *httptest.Server {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			time.Sleep(5 * time.Second)
+			select {
+			case <-time.After(5 * time.Second):
+			case <-r.Context().Done():
+				return
+			}
 			w.Header().Set("Content-Type", "text/html")
 			fmt.Fprint(w, `<html><body>Slow</body></html>`)
 		})

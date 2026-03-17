@@ -228,7 +228,11 @@ func TestCrawler_ContextCancellation(t *testing.T) {
 		fmt.Fprint(w, `<html><body><a href="/slow">Slow</a></body></html>`)
 	})
 	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(10 * time.Second) // very slow
+		select {
+		case <-time.After(10 * time.Second): // very slow
+		case <-r.Context().Done(): // client cancelled, return immediately
+			return
+		}
 		w.Header().Set("Content-Type", "text/html")
 		fmt.Fprint(w, `<html><body>Slow page</body></html>`)
 	})
