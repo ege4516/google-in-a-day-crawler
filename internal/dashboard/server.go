@@ -895,7 +895,14 @@ const dashboardHTML = `<!DOCTYPE html>
 
         var pollInterval = 2000;
         var timer = setInterval(function() {
-            fetch("/?tab=" + currentTab + "&_t=" + Date.now(), {headers: {"Accept": "text/html", "Cache-Control": "no-cache"}})
+            var fetchURL = "/?tab=" + currentTab + "&_t=" + Date.now();
+            if (currentTab === "search") {
+                var searchInput = document.querySelector('.search-box input[name="q"]');
+                if (searchInput && searchInput.value) {
+                    fetchURL += "&q=" + encodeURIComponent(searchInput.value);
+                }
+            }
+            fetch(fetchURL, {headers: {"Accept": "text/html", "Cache-Control": "no-cache"}})
                 .then(function(resp) { return resp.text(); })
                 .then(function(html) {
                     var parser = new DOMParser();
