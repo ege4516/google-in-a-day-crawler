@@ -71,7 +71,7 @@ func TestCrawler_AllPagesReached(t *testing.T) {
 		SameDomain:     true,
 	}
 
-	c := NewCrawler(cfg, 0, idx, metrics, nil)
+	c := NewCrawler(cfg, 0, idx, metrics, nil, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -110,7 +110,7 @@ func TestCrawler_DepthLimit(t *testing.T) {
 		SameDomain:     true,
 	}
 
-	c := NewCrawler(cfg, 0, idx, metrics, nil)
+	c := NewCrawler(cfg, 0, idx, metrics, nil, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -140,7 +140,7 @@ func TestCrawler_NoDuplicates(t *testing.T) {
 		SameDomain:     true,
 	}
 
-	c := NewCrawler(cfg, 0, idx, metrics, nil)
+	c := NewCrawler(cfg, 0, idx, metrics, nil, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -197,7 +197,7 @@ func TestCrawler_SearchDuringCrawl(t *testing.T) {
 		SameDomain:     true,
 	}
 
-	c := NewCrawler(cfg, 0, idx, metrics, nil)
+	c := NewCrawler(cfg, 0, idx, metrics, nil, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -210,7 +210,7 @@ func TestCrawler_SearchDuringCrawl(t *testing.T) {
 
 	// Wait a bit then search while crawling
 	time.Sleep(200 * time.Millisecond)
-	results := index.Search("searchable", idx, 10)
+	results := index.Search("searchable", idx, 10, "relevance")
 	// We should find at least the homepage (it's fast to crawl)
 	if len(results) == 0 && idx.DocCount() > 0 {
 		t.Log("Warning: search returned 0 results but docs exist — timing dependent")
@@ -252,7 +252,7 @@ func TestCrawler_ContextCancellation(t *testing.T) {
 		SameDomain:     true,
 	}
 
-	c := NewCrawler(cfg, 0, idx, metrics, nil)
+	c := NewCrawler(cfg, 0, idx, metrics, nil, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
@@ -283,7 +283,7 @@ func TestCrawler_MetricsConsistency(t *testing.T) {
 		SameDomain:     true,
 	}
 
-	c := NewCrawler(cfg, 0, idx, metrics, nil)
+	c := NewCrawler(cfg, 0, idx, metrics, nil, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 

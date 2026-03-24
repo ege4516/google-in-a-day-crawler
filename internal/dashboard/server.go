@@ -47,6 +47,7 @@ func (s *Server) Start() error {
 	// JSON APIs
 	mux.HandleFunc("/api/metrics", s.handleMetrics)
 	mux.HandleFunc("/api/search", s.handleSearch)
+	mux.HandleFunc("/search", s.handleSearch) // alias for /api/search
 	mux.HandleFunc("/api/crawls", s.handleCrawls)
 	mux.HandleFunc("/api/crawls/", s.handleCrawlByID)
 	mux.HandleFunc("/api/crawls/completed", s.handleClearCompleted)
@@ -268,8 +269,12 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 
 	q := r.URL.Query().Get("q")
 	if q != "" {
+		sortBy := r.URL.Query().Get("sortBy")
+		if sortBy == "" {
+			sortBy = "relevance"
+		}
 		data.Query = q
-		data.Results = index.Search(q, s.manager.GetIndex(), 20)
+		data.Results = index.Search(q, s.manager.GetIndex(), 20, sortBy)
 		data.Tab = "search"
 	}
 
@@ -289,14 +294,23 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+	// Support both "q" and "query" parameter names
 	q := r.URL.Query().Get("q")
+	if q == "" {
+		q = r.URL.Query().Get("query")
+	}
 	topK := 20
 	if k := r.URL.Query().Get("k"); k != "" {
 		if n, err := strconv.Atoi(k); err == nil && n > 0 {
 			topK = n
 		}
 	}
-	results := index.Search(q, s.manager.GetIndex(), topK)
+	// sortBy parameter: relevance (default), depth, frequency
+	sortBy := r.URL.Query().Get("sortBy")
+	if sortBy == "" {
+		sortBy = "relevance"
+	}
+	results := index.Search(q, s.manager.GetIndex(), topK, sortBy)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(results)
 }
@@ -705,6 +719,11 @@ const dashboardHTML = `<!DOCTYPE html>
         <form method="GET" action="/" class="search-box">
             <input type="hidden" name="tab" value="search">
             <input type="text" name="q" placeholder="Search indexed pages..." value="{{.Query}}" autofocus>
+            <select name="sortBy" style="padding: 12px 14px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; font-size: 0.9em; cursor: pointer;">
+                <option value="relevance">Sort: Relevance</option>
+                <option value="depth">Sort: Depth</option>
+                <option value="frequency">Sort: Frequency</option>
+            </select>
             <button type="submit">Search</button>
         </form>
 
@@ -715,7 +734,8 @@ const dashboardHTML = `<!DOCTYPE html>
             <div class="url"><a href="{{.URL}}" target="_blank" rel="noopener">{{.URL}}</a></div>
             <div class="title">{{if .Title}}{{.Title}}{{else}}(no title){{end}}</div>
             <div class="meta">
-                <span>Score: {{printf "%.2f" .Score}}</span>
+                <span>Score: {{printf "%.0f" .Score}}</span>
+                <span>Frequency: {{.Frequency}}</span>
                 <span>Depth: {{.Depth}}</span>
                 <span>Origin: {{if .OriginURL}}<a href="{{.OriginURL}}" target="_blank" rel="noopener" style="color:#8b949e;">{{.OriginURL}}</a>{{else}}(seed){{end}}</span>
             </div>

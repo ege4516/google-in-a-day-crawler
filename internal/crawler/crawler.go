@@ -21,6 +21,7 @@ type Crawler struct {
 	index     *index.Index
 	metrics   *Metrics
 	db        *storage.DB // optional persistence; nil disables it
+	dataDir   string      // directory for flat-file storage (p.data)
 }
 
 // Config holds crawler configuration.
@@ -63,13 +64,14 @@ type Metrics struct {
 }
 
 // NewCrawler creates a new crawler instance. Pass nil for db to disable persistence.
-func NewCrawler(cfg Config, sessionID int64, idx *index.Index, metrics *Metrics, db *storage.DB) *Crawler {
+func NewCrawler(cfg Config, sessionID int64, idx *index.Index, metrics *Metrics, db *storage.DB, dataDir string) *Crawler {
 	return &Crawler{
 		cfg:       cfg,
 		sessionID: sessionID,
 		index:     idx,
 		metrics:   metrics,
 		db:        db,
+		dataDir:   dataDir,
 	}
 }
 
@@ -169,8 +171,13 @@ func (c *Crawler) Start(ctx context.Context, resume *ResumeState) {
 			case record, ok := <-resultsCh:
 				if !ok {
 					// Channel closed, flush remaining
-					if c.db != nil && len(pendingPostings) > 0 {
-						c.db.SavePostingsBatch(pendingPostings)
+					if len(pendingPostings) > 0 {
+						if c.db != nil {
+							c.db.SavePostingsBatch(pendingPostings)
+						}
+						if c.dataDir != "" {
+							storage.AppendPostingsToFile(storage.PDataPath(c.dataDir), pendingPostings)
+						}
 					}
 					return
 				}
@@ -187,18 +194,26 @@ func (c *Crawler) Start(ctx context.Context, resume *ResumeState) {
 					c.metrics.IndexedDocs.Add(1)
 
 					// Queue postings for batch persistence
-					if c.db != nil {
-						pendingPostings = collectPostings(pendingPostings, record)
-						if len(pendingPostings) >= 500 {
+					pendingPostings = collectPostings(pendingPostings, record)
+					if len(pendingPostings) >= 500 {
+						if c.db != nil {
 							c.db.SavePostingsBatch(pendingPostings)
-							pendingPostings = pendingPostings[:0]
 						}
+						if c.dataDir != "" {
+							storage.AppendPostingsToFile(storage.PDataPath(c.dataDir), pendingPostings)
+						}
+						pendingPostings = pendingPostings[:0]
 					}
 				}
 				c.metrics.PagesProcessed.Add(1)
 			case <-flushInterval.C:
-				if c.db != nil && len(pendingPostings) > 0 {
-					c.db.SavePostingsBatch(pendingPostings)
+				if len(pendingPostings) > 0 {
+					if c.db != nil {
+						c.db.SavePostingsBatch(pendingPostings)
+					}
+					if c.dataDir != "" {
+						storage.AppendPostingsToFile(storage.PDataPath(c.dataDir), pendingPostings)
+					}
 					pendingPostings = pendingPostings[:0]
 				}
 			}

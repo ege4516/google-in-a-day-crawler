@@ -48,7 +48,7 @@ func TestManager_StartCrawl(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	m := NewManager(ctx, nil)
+	m := NewManager(ctx, nil, "")
 
 	cfg := Config{
 		SeedURL:        ts.URL,
@@ -86,7 +86,7 @@ func TestManager_ConcurrentCrawls(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	m := NewManager(ctx, nil)
+	m := NewManager(ctx, nil, "")
 
 	cfg1 := Config{
 		SeedURL:        ts1.URL,
@@ -159,7 +159,7 @@ func TestManager_StopCrawl(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	m := NewManager(ctx, nil)
+	m := NewManager(ctx, nil, "")
 
 	cfg := Config{
 		SeedURL:        ts.URL,
@@ -211,7 +211,7 @@ func TestManager_StopCrawlByID(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	m := NewManager(ctx, nil)
+	m := NewManager(ctx, nil, "")
 
 	cfg1 := Config{
 		SeedURL:        ts1.URL,
@@ -272,7 +272,7 @@ func TestManager_IsRunning(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	m := NewManager(ctx, nil)
+	m := NewManager(ctx, nil, "")
 
 	// Initially not running
 	if m.IsRunning() {
@@ -312,7 +312,7 @@ func TestManager_IndexAccumulates(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	m := NewManager(ctx, nil)
+	m := NewManager(ctx, nil, "")
 
 	cfg := Config{
 		SeedURL:        ts.URL,

@@ -12,11 +12,13 @@ type SearchResult struct {
 	Title     string  `json:"title"`
 	Snippet   string  `json:"snippet"`
 	Score     float64 `json:"score"`
+	Frequency int     `json:"frequency"`
 }
 
 // Search processes a query against the index and returns ranked results.
-// Scoring: title match (3x) + URL match (2x) + body frequency (1x, capped).
-func Search(query string, idx *Index, topK int) []SearchResult {
+// Scoring: score = (frequency × 10) + 1000 (exact match bonus) − (depth × 5)
+// sortBy: "relevance" (default), "depth", "frequency"
+func Search(query string, idx *Index, topK int, sortBy string) []SearchResult {
 	queryTokens := tokenize(query)
 	if len(queryTokens) == 0 {
 		return nil
@@ -29,6 +31,7 @@ func Search(query string, idx *Index, topK int) []SearchResult {
 		depth     int
 		title     string
 		score     float64
+		frequency int
 	}
 	scores := make(map[string]*docInfo)
 
@@ -46,26 +49,13 @@ func Search(query string, idx *Index, topK int) []SearchResult {
 				scores[p.URL] = info
 			}
 
-			// Title match: weight 3.0
-			if p.InTitle {
-				info.score += 3.0
-			}
-
-			// URL match: weight 2.0
-			if p.InURL {
-				info.score += 2.0
-			}
-
-			// Body frequency: weight 1.0, capped at 5
-			tf := float64(p.TermFreq)
-			if tf > 5 {
-				tf = 5
-			}
-			info.score += tf / 5.0
+			// Relevance score: (frequency × 10) + 1000 (exact match bonus) − (depth × 5)
+			info.score += float64(p.TermFreq*10) + 1000.0 - float64(p.Depth*5)
+			info.frequency += p.TermFreq
 		}
 	}
 
-	// Collect and sort
+	// Collect results
 	results := make([]SearchResult, 0, len(scores))
 	for _, info := range scores {
 		results = append(results, SearchResult{
@@ -74,12 +64,31 @@ func Search(query string, idx *Index, topK int) []SearchResult {
 			Depth:     info.depth,
 			Title:     info.title,
 			Score:     info.score,
+			Frequency: info.frequency,
 		})
 	}
 
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Score > results[j].Score
-	})
+	// Sort based on sortBy parameter
+	switch sortBy {
+	case "depth":
+		sort.Slice(results, func(i, j int) bool {
+			if results[i].Depth != results[j].Depth {
+				return results[i].Depth < results[j].Depth
+			}
+			return results[i].Score > results[j].Score // tie-break by score
+		})
+	case "frequency":
+		sort.Slice(results, func(i, j int) bool {
+			if results[i].Frequency != results[j].Frequency {
+				return results[i].Frequency > results[j].Frequency
+			}
+			return results[i].Score > results[j].Score // tie-break by score
+		})
+	default: // "relevance"
+		sort.Slice(results, func(i, j int) bool {
+			return results[i].Score > results[j].Score
+		})
+	}
 
 	if topK > 0 && len(results) > topK {
 		results = results[:topK]

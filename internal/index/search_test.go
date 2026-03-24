@@ -26,7 +26,7 @@ func setupTestIndex() *Index {
 
 func TestSearch_EmptyQuery(t *testing.T) {
 	idx := setupTestIndex()
-	results := Search("", idx, 10)
+	results := Search("", idx, 10, "relevance")
 	if len(results) != 0 {
 		t.Errorf("empty query should return 0 results, got %d", len(results))
 	}
@@ -34,7 +34,7 @@ func TestSearch_EmptyQuery(t *testing.T) {
 
 func TestSearch_StopWordsOnly(t *testing.T) {
 	idx := setupTestIndex()
-	results := Search("the and is", idx, 10)
+	results := Search("the and is", idx, 10, "relevance")
 	if len(results) != 0 {
 		t.Errorf("query of only stop words should return 0 results, got %d", len(results))
 	}
@@ -42,7 +42,7 @@ func TestSearch_StopWordsOnly(t *testing.T) {
 
 func TestSearch_TitleMatchScoresHigher(t *testing.T) {
 	idx := setupTestIndex()
-	results := Search("rust", idx, 10)
+	results := Search("rust", idx, 10, "relevance")
 	if len(results) == 0 {
 		t.Fatal("expected results for 'rust'")
 	}
@@ -54,7 +54,7 @@ func TestSearch_TitleMatchScoresHigher(t *testing.T) {
 
 func TestSearch_ReturnsResults(t *testing.T) {
 	idx := setupTestIndex()
-	results := Search("programming", idx, 10)
+	results := Search("programming", idx, 10, "relevance")
 	if len(results) < 2 {
 		t.Fatalf("expected >= 2 results for 'programming', got %d", len(results))
 	}
@@ -62,7 +62,7 @@ func TestSearch_ReturnsResults(t *testing.T) {
 
 func TestSearch_TopKLimit(t *testing.T) {
 	idx := setupTestIndex()
-	results := Search("programming", idx, 1)
+	results := Search("programming", idx, 1, "relevance")
 	if len(results) > 1 {
 		t.Errorf("topK=1 but got %d results", len(results))
 	}
@@ -70,7 +70,7 @@ func TestSearch_TopKLimit(t *testing.T) {
 
 func TestSearch_MultiToken(t *testing.T) {
 	idx := setupTestIndex()
-	results := Search("go programming", idx, 10)
+	results := Search("go programming", idx, 10, "relevance")
 	if len(results) == 0 {
 		t.Fatal("expected results for multi-token query")
 	}
@@ -89,7 +89,7 @@ func TestSearch_ResultFields(t *testing.T) {
 		Title:     "Test Page",
 		BodyText:  "testing content",
 	})
-	results := Search("test", idx, 10)
+	results := Search("test", idx, 10, "relevance")
 	if len(results) == 0 {
 		t.Fatal("expected results")
 	}
@@ -113,7 +113,7 @@ func TestSearch_ResultFields(t *testing.T) {
 
 func TestSearch_NoMatch(t *testing.T) {
 	idx := setupTestIndex()
-	results := Search("xyznonexistent", idx, 10)
+	results := Search("xyznonexistent", idx, 10, "relevance")
 	if len(results) != 0 {
 		t.Errorf("expected 0 results for non-matching query, got %d", len(results))
 	}

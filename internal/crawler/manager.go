@@ -38,16 +38,18 @@ type Manager struct {
 	nextID    int64                  // local ID counter when DB is nil
 	parentCtx context.Context
 	db        *storage.DB // optional persistence; nil disables it
+	dataDir   string      // directory for flat-file storage (p.data)
 }
 
 // NewManager creates a Manager with a fresh Index.
-// Pass nil for db to disable persistence.
-func NewManager(ctx context.Context, db *storage.DB) *Manager {
+// Pass nil for db to disable persistence. dataDir is used for flat-file storage.
+func NewManager(ctx context.Context, db *storage.DB, dataDir string) *Manager {
 	return &Manager{
 		idx:       index.NewIndex(),
 		crawls:    make(map[int64]*activeCrawl),
 		parentCtx: ctx,
 		db:        db,
+		dataDir:   dataDir,
 	}
 }
 
@@ -64,7 +66,35 @@ func (m *Manager) HasResumableState() (*storage.CrawlState, bool) {
 }
 
 // RestoreIndex loads all persisted postings back into the in-memory index.
+// Tries p.data first, falls back to SQLite.
 func (m *Manager) RestoreIndex() error {
+	// Try loading from p.data first
+	if m.dataDir != "" {
+		pdataPath := storage.PDataPath(m.dataDir)
+		postings, err := storage.LoadPostingsFromFile(pdataPath)
+		if err != nil {
+			log.Printf("Warning: failed to load p.data: %v, falling back to database", err)
+		} else if len(postings) > 0 {
+			urls := make(map[string]struct{})
+			for _, p := range postings {
+				m.idx.AddPosting(p.Token, index.Posting{
+					URL:       p.URL,
+					OriginURL: p.OriginURL,
+					Depth:     p.Depth,
+					Title:     p.Title,
+					TermFreq:  p.TermFreq,
+					InTitle:   p.InTitle,
+					InURL:     p.InURL,
+				})
+				urls[p.URL] = struct{}{}
+			}
+			m.idx.SetDocCount(len(urls))
+			log.Printf("Restored %d postings for %d documents from p.data", len(postings), len(urls))
+			return nil
+		}
+	}
+
+	// Fallback to SQLite
 	if m.db == nil {
 		return nil
 	}
@@ -143,7 +173,7 @@ func (m *Manager) ResumeCrawl(cfg Config) (<-chan struct{}, error) {
 		seedURL:   cfg.SeedURL,
 	}
 
-	c := NewCrawler(cfg, sessionID, m.idx, metrics, m.db)
+	c := NewCrawler(cfg, sessionID, m.idx, metrics, m.db, m.dataDir)
 
 	done := make(chan struct{})
 	ac.done = done
@@ -188,7 +218,12 @@ func (m *Manager) StartCrawl(cfg Config) (int64, <-chan struct{}, error) {
 		seedURL:   cfg.SeedURL,
 	}
 
-	c := NewCrawler(cfg, sessionID, m.idx, metrics, m.db)
+	c := NewCrawler(cfg, sessionID, m.idx, metrics, m.db, m.dataDir)
+
+	// Clear p.data for fresh crawl (first crawl only, not resume)
+	if m.dataDir != "" {
+		storage.ClearPDataFile(storage.PDataPath(m.dataDir))
+	}
 
 	done := make(chan struct{})
 	ac.done = done
@@ -394,7 +429,7 @@ func (m *Manager) ResumeCrawlByID(sessionID int64) (int64, <-chan struct{}, erro
 		seedURL:   sess.OriginURL,
 	}
 
-	c := NewCrawler(cfg, sessionID, m.idx, metrics, m.db)
+	c := NewCrawler(cfg, sessionID, m.idx, metrics, m.db, m.dataDir)
 
 	done := make(chan struct{})
 	ac.done = done

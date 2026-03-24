@@ -42,7 +42,7 @@ func parseFlags() CrawlConfig {
 	flag.DurationVar(&cfg.RequestTimeout, "timeout", 10*time.Second, "HTTP request timeout")
 	flag.Int64Var(&cfg.MaxBodySize, "max-body", 1<<20, "Maximum response body size in bytes")
 	flag.BoolVar(&cfg.SameDomain, "same-domain", true, "Only crawl links on the seed domain(s)")
-	flag.IntVar(&cfg.DashboardPort, "port", 8080, "Dashboard HTTP port")
+	flag.IntVar(&cfg.DashboardPort, "port", 3600, "Dashboard HTTP port")
 	flag.StringVar(&cfg.DataDir, "data", "data", "Directory for persistent storage")
 	flag.Parse()
 	return cfg
@@ -94,7 +94,7 @@ func main() {
 	}
 
 	// Create manager (owns index + metrics lifecycle)
-	manager := crawler.NewManager(ctx, db)
+	manager := crawler.NewManager(ctx, db, cfg.DataDir)
 
 	// Restore index from persisted data
 	if db != nil {

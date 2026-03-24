@@ -72,13 +72,13 @@ Starting a crawl (via CLI flag `-seed` or the dashboard form) triggers `Manager.
 
 1. The query is tokenized with the same rules as indexing (lowercase, split on non-alphanumeric, remove stop words and short tokens).
 2. For each query token, postings are looked up in the inverted index.
-3. Scores accumulate per URL: **+3.0** for title match, **+2.0** for URL match, **+min(tf, 5) / 5.0** for body frequency.
+3. Scores accumulate per URL: **(frequency × 10) + 1000 (exact match bonus) − (depth × 5)** per matching token.
 4. Results are sorted by score descending, truncated to `topK`.
 5. Each result includes: `url`, `origin_url`, `depth`, `title`, `score`.
 
 ## Dashboard
 
-Open [http://localhost:8080](http://localhost:8080) after starting the application.
+Open [http://localhost:3600](http://localhost:3600) after starting the application.
 
 **Three tabs:**
 
@@ -111,7 +111,7 @@ Each crawl is tracked as a session with status: `queued` → `running` → `comp
 | `-timeout` | 10s | HTTP request timeout per page |
 | `-max-body` | 1048576 | Maximum response body size in bytes (1 MB) |
 | `-same-domain` | true | Only follow links on the seed domain(s) |
-| `-port` | 8080 | Dashboard HTTP port |
+| `-port` | 3600 | Dashboard HTTP port |
 | `-data` | data | Directory for SQLite database file |
 
 ## API Endpoints
@@ -120,7 +120,7 @@ Each crawl is tracked as a session with status: `queued` → `running` → `comp
 |--------|----------|-------------|
 | `GET` | `/` | Web dashboard (HTML) |
 | `GET` | `/api/metrics` | JSON metrics snapshot for the most recent crawl |
-| `GET` | `/api/search?q=<query>&k=<topK>` | JSON search results (default k=20) |
+| `GET` | `/search?query=<query>&sortBy=relevance` | JSON search results (also: `/api/search?q=<query>&k=<topK>`) |
 | `GET` | `/api/crawls` | List all crawl sessions (JSON) |
 | `POST` | `/api/crawls` | Create a new crawl (JSON body) |
 | `GET` | `/api/crawls/{id}` | Get a specific session |
