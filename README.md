@@ -1,6 +1,6 @@
 # Google in a Day
 
-A concurrent web crawler and real-time search engine built in Go. Crawls from one or more seed URLs up to a configurable depth, indexes pages into an in-memory inverted index backed by SQLite, and serves ranked search results through a live web dashboard — all while crawling is still in progress.
+A concurrent web crawler and real-time search engine built in Go. Crawls from one or more seed URLs up to a configurable depth, indexes pages into an in-memory inverted index backed by native flat-file storage (`data/storage/p.data`) and SQLite, and serves ranked search results through a live web dashboard — all while crawling is still in progress.
 
 Built as a course project exploring concurrent systems design: goroutines, channels, mutexes, graceful shutdown, and back-pressure control.
 
@@ -10,7 +10,7 @@ Built as a course project exploring concurrent systems design: goroutines, chann
 - **Real-time search** that returns results while crawling is still running
 - **Web dashboard** with three tabs: Search, Create Crawler, Crawler Status
 - **Multiple concurrent crawls** — each tracked as an independent session
-- **SQLite persistence** — crawl sessions, visited URLs, queued tasks, and index postings survive restarts
+- **Dual persistence** — postings stored natively in `data/storage/p.data` (flat file); crawl sessions, visited URLs, and queued tasks in SQLite
 - **Resume** — stopped crawls can be resumed from exactly where they left off
 - **Back-pressure** — bounded task channel with overflow buffer; no unbounded memory growth
 - **Duplicate prevention** — coordinator-owned visited set ensures each URL is fetched at most once
@@ -31,7 +31,7 @@ Seed URL(s) --> Coordinator --> taskCh --> Worker Pool --> HTTP Fetch --> Parse 
                                                                                        |
                                                                             Search <---+
                                                                               |
-                                                 SQLite <-- Persistence    Dashboard :8080
+                                                  SQLite <-- Persistence    Dashboard :3600
 ```
 
 Four packages, clean separation:
@@ -41,7 +41,7 @@ Four packages, clean separation:
 | `cmd/crawler` | Entry point, CLI flags, signal handling, wiring |
 | `internal/crawler` | Coordinator loop, worker pool, manager (session lifecycle), metrics |
 | `internal/index` | Inverted index (map + RWMutex), tokenizer, search scoring |
-| `internal/storage` | SQLite schema, CRUD for sessions/visited/queue/postings |
+| `internal/storage` | SQLite schema, CRUD for sessions/visited/queue; native `p.data` flat-file for postings |
 | `internal/dashboard` | HTTP server, web UI (embedded HTML), REST API |
 
 **Key design decisions:**
@@ -50,7 +50,7 @@ Four packages, clean separation:
 - **Overflow buffer**: The coordinator uses non-blocking sends to `taskCh`. When the channel is full, excess URLs go into a local slice drained on the next iteration. The overflow size is exposed on the dashboard as the back-pressure indicator.
 - **RWMutex on index**: The indexer goroutine holds a write lock; search requests hold a read lock. Multiple concurrent searches proceed without blocking each other.
 - **Atomic metrics**: All counters use `sync/atomic` so the dashboard can read them without locks.
-- **SQLite persistence**: `modernc.org/sqlite` (pure Go, no CGO) stores sessions, visited URLs, the task queue, and index postings. On startup, persisted postings are loaded back into the in-memory index.
+- **Dual persistence**: Postings are stored natively in `data/storage/p.data` (flat file, format: `word url origin depth frequency`). On startup, `RestoreIndex()` loads from `p.data` first, falling back to SQLite if the file doesn't exist. SQLite (`modernc.org/sqlite`, pure Go, no CGO) stores sessions, visited URLs, and the task queue.
 
 ## How It Works
 
@@ -68,13 +68,13 @@ Starting a crawl (via CLI flag `-seed` or the dashboard form) triggers `Manager.
 
 ### `search(query)`
 
-`Search(query, index, topK)` is callable at any time, including during active crawling:
+`Search(query, index, topK, sortBy)` is callable at any time, including during active crawling:
 
 1. The query is tokenized with the same rules as indexing (lowercase, split on non-alphanumeric, remove stop words and short tokens).
 2. For each query token, postings are looked up in the inverted index.
 3. Scores accumulate per URL: **(frequency × 10) + 1000 (exact match bonus) − (depth × 5)** per matching token.
 4. Results are sorted by score descending, truncated to `topK`.
-5. Each result includes: `url`, `origin_url`, `depth`, `title`, `score`.
+5. Each result includes: `url`, `origin_url`, `depth`, `title`, `score`, `frequency`.
 
 ## Dashboard
 
@@ -84,7 +84,7 @@ Open [http://localhost:3600](http://localhost:3600) after starting the applicati
 
 | Tab | What it does |
 |-----|-------------|
-| **Search** | Enter a query, get ranked results with URL, title, score, depth, and origin |
+| **Search** | Enter a query, select sort order (Relevance/Depth/Frequency), get ranked results with URL, title, score, frequency, depth, and origin |
 | **Create Crawler** | Enter seed URL(s) (one per line), max depth, max URLs, workers, queue size, same-domain toggle; click Start |
 | **Crawler Status** | Table of all sessions with status badges, config, live stats, and Stop/Resume buttons |
 
@@ -112,7 +112,7 @@ Each crawl is tracked as a session with status: `queued` → `running` → `comp
 | `-max-body` | 1048576 | Maximum response body size in bytes (1 MB) |
 | `-same-domain` | true | Only follow links on the seed domain(s) |
 | `-port` | 3600 | Dashboard HTTP port |
-| `-data` | data | Directory for SQLite database file |
+| `-data` | data | Directory for persistent storage (SQLite DB + p.data) |
 
 ## API Endpoints
 
@@ -149,7 +149,7 @@ make run            # or ./crawler (for Linux and MacOS)
 ./crawler     #.\crawler.exe (for Windows) 
 
 # Open the dashboard
-# http://localhost:8080
+# http://localhost:3600
 ```
 
 ### Run tests
@@ -193,20 +193,20 @@ All integration tests use `httptest.Server` with controlled link graphs — no e
 │   │   ├── search.go                Query scoring and ranking
 │   │   └── search_test.go           Search unit tests
 │   ├── storage/
-│   │   └── sqlite.go                SQLite schema (7 tables), all persistence CRUD
+│   │   ├── sqlite.go                SQLite schema (7 tables), all persistence CRUD
+│   │   └── pdata.go                 Native p.data file writer/reader for postings
 │   └── dashboard/
 │       └── server.go                HTTP server, embedded HTML dashboard, REST API
 ├── Makefile                         build / run / test / clean targets
 ├── go.mod
 ├── product_prd.md                   Product requirements document
 ├── recommendation.md                Production next-steps recommendation
-└── .gitignore
 ```
 
 ## Assumptions and Limitations
 
 - **HTML only** — fetches HTTP/HTTPS pages with `text/html` or `application/xhtml` content types. PDFs, images, JS-rendered SPAs, and binary files are skipped.
-- **Heuristic ranking** — scoring is title/URL/frequency-based, not TF-IDF or BM25.
+- **Formula-based ranking** — scoring uses `(frequency × 10) + 1000 − (depth × 5)` per matching token. Supports `sortBy` parameter: `relevance`, `depth`, `frequency`.
 - **No robots.txt** — the crawler does not parse or honor robots.txt directives.
 - **No per-host rate limiting** — workers fetch as fast as the network allows, bounded only by worker count and timeouts.
 - **Snippet field unused** — the `SearchResult` struct has a `Snippet` field but it is never populated; results show title and score only.

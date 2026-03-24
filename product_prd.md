@@ -2,7 +2,7 @@
 
 ## 1. Product Overview
 
-Google in a Day is a concurrent web crawler and real-time search engine built in Go. It crawls web pages starting from one or more seed URLs up to a configurable depth, indexes their content into an in-memory inverted index, persists state to SQLite, and serves ranked search results through a web dashboard. Multiple independent crawls can run concurrently, each tracked as a session with full lifecycle management (start, stop, resume).
+Google in a Day is a concurrent web crawler and real-time search engine built in Go. It crawls web pages starting from one or more seed URLs up to a configurable depth, indexes their content into an in-memory inverted index, persists postings natively to `data/storage/p.data` and session state to SQLite, and serves ranked search results through a web dashboard. Multiple independent crawls can run concurrently, each tracked as a session with full lifecycle management (start, stop, resume).
 
 The project is a course assignment focused on concurrent systems design. It demonstrates goroutine coordination, channel-based communication, lock-free metrics, bounded-resource architectures, and graceful shutdown — all within a single-binary Go application.
 
@@ -29,7 +29,7 @@ The primary educational value is **concurrent systems design**: managing multipl
 ## 4. User Flows
 
 ### Starting a Crawl (Dashboard)
-1. User opens `http://localhost:8080`
+1. User opens `http://localhost:3600`
 2. Clicks the **Create Crawler** tab
 3. Enters one or more seed URLs (one per line), configures depth, max URLs, workers, queue size, same-domain toggle
 4. Clicks **Start Crawling**
@@ -37,7 +37,7 @@ The primary educational value is **concurrent systems design**: managing multipl
 
 ### Starting a Crawl (CLI)
 1. User runs `./crawler -seed https://example.com -depth 2 -workers 5`
-2. Crawl starts immediately; dashboard opens at `localhost:8080` for monitoring
+2. Crawl starts immediately; dashboard opens at `localhost:3600` for monitoring
 
 ### Searching Indexed Content
 1. User clicks the **Search** tab (or navigates to `/?tab=search&q=golang`)
@@ -87,16 +87,16 @@ The primary educational value is **concurrent systems design**: managing multipl
 | Tokenization | Lowercase, split on non-alphanumeric, remove tokens < 2 chars, remove 85 English stop words |
 | Inverted index structure | `map[string][]Posting` protected by `sync.RWMutex` |
 | Posting metadata | URL, OriginURL, Depth, Title, TermFreq, InTitle (bool), InURL (bool) |
-| Batch persistence | Postings flushed to SQLite every 500 records or every 3 seconds |
-| Index restoration | On startup, `RestoreIndex()` loads all persisted postings into memory |
+| Batch persistence | Postings written natively to `data/storage/p.data` (format: `word url origin depth frequency`) and also flushed to SQLite |
+| Index restoration | On startup, `RestoreIndex()` loads postings from `p.data` first; falls back to SQLite if `p.data` doesn't exist |
 
 ### 5.3 Search (`search(query)`)
 
 | Requirement | Implementation |
 |-------------|---------------|
 | Query tokenization | Same tokenizer as indexing |
-| Scoring | Title match: +3.0, URL match: +2.0, Body frequency: +min(tf, 5) / 5.0 per query token |
-| Result format | `{url, origin_url, depth, title, snippet, score}` — note: snippet is always empty |
+| Scoring | `(frequency × 10) + 1000 (exact match bonus) − (depth × 5)` per matching query token. Supports `sortBy`: `relevance` (default), `depth`, `frequency` |
+| Result format | `{url, origin_url, depth, title, snippet, score, frequency}` — note: snippet is always empty |
 | Sorting | Score descending |
 | TopK | Configurable via `k` query param (default 20) |
 | Concurrent safety | Read lock on index; multiple searches can run simultaneously during crawling |
@@ -146,7 +146,7 @@ CrawlTask       { URL, OriginURL, Depth }
 PageRecord      { URL, OriginURL, Depth, Title, BodyText, Links, StatusCode, CrawledAt, Error }
 Posting         { URL, OriginURL, Depth, Title, TermFreq, InTitle, InURL }
 Document        { URL, OriginURL, Depth, Title, BodyText }
-SearchResult    { URL, OriginURL, Depth, Title, Snippet, Score }
+SearchResult    { URL, OriginURL, Depth, Title, Snippet, Score, Frequency }
 Metrics         { PagesProcessed, PagesQueued, PagesErrored, QueueDepth, ActiveWorkers,
                   IndexedDocs, OverflowSize, MaxURLs, StartTime, CrawlDone, StopReason }
 CrawlSession    { ID, OriginURL, MaxDepth, MaxURLs, NumWorkers, QueueSize, SameDomain,
@@ -182,7 +182,7 @@ WAL journal mode. Busy timeout 5000 ms. Tables created idempotently with `IF NOT
 | `-timeout` | duration | 10s | HTTP request timeout |
 | `-max-body` | int | 1048576 | Max response body (bytes) |
 | `-same-domain` | bool | true | Restrict to seed domain(s) |
-| `-port` | int | 8080 | Dashboard HTTP port |
+| `-port` | int | 3600 | Dashboard HTTP port |
 | `-data` | string | `"data"` | SQLite database directory |
 
 ### HTTP Endpoints
@@ -191,7 +191,7 @@ WAL journal mode. Busy timeout 5000 ms. Tables created idempotently with `IF NOT
 |--------|------|---------|-------------|
 | GET | `/` | `handlePage` | Dashboard HTML (tabs: search, create, status) |
 | GET | `/api/metrics` | `handleMetrics` | JSON metrics snapshot |
-| GET | `/api/search` | `handleSearch` | JSON search results; params: `q`, `k` |
+| GET | `/search` | `handleSearch` | JSON search results; params: `query`, `sortBy` (also: `/api/search?q=...&k=...`) |
 | GET | `/api/crawls` | `handleCrawls` | List all sessions |
 | POST | `/api/crawls` | `handleCrawls` | Create new crawl |
 | GET | `/api/crawls/{id}` | `handleCrawlByID` | Get session details |
@@ -244,7 +244,7 @@ Channels:
 - **Single machine**: Designed for localhost operation at a scale of hundreds to low-thousands of pages.
 - **No robots.txt**: The crawler does not parse or honor robots.txt files.
 - **No rate limiting**: Workers fetch as fast as the network allows, throttled only by worker count and HTTP timeout.
-- **Heuristic ranking**: Scores are based on title/URL/frequency weights. No TF-IDF, BM25, or PageRank.
+- **Formula-based ranking**: Scores use `(frequency × 10) + 1000 − (depth × 5)`. Supports sortBy parameter for different orderings.
 - **English stop words**: The tokenizer removes 85 English stop words. Other languages are not specifically handled.
 - **Data directory**: SQLite database is stored in `./data/crawler.db` by default. The directory is created if it doesn't exist.
 
@@ -276,7 +276,7 @@ Aligned with course grading rubric:
 2. **No robots.txt support** — the crawler does not check or honor robots.txt directives.
 3. **No per-host rate limiting** — a fast crawl can saturate a single target server.
 4. **Stop-word list is English-only** — non-English pages are indexed but common words in other languages are not filtered.
-5. **No TF-IDF weighting** — term frequency scoring is capped at 5 occurrences without inverse-document-frequency normalization.
+5. **No TF-IDF weighting** — scoring uses a fixed formula `(frequency × 10) + 1000 − (depth × 5)` without inverse-document-frequency normalization.
 6. **Dashboard URL routing is path-prefix based** — no proper router library; relies on `strings.TrimPrefix` patterns.
 7. **Legacy API endpoints** — `/api/index` and `/api/stop` coexist with the newer `/api/crawls` RESTful routes.
 
